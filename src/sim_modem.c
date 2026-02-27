@@ -92,13 +92,13 @@ static int read_line(sim_modem_config_t *config, char *buf, size_t buf_size,
 //
 //  The modem's state machine gates which commands are valid.
 //
-//  TODO — implement these commands in order of priority:
+//  Supported commands and their behavior:
 //
 //  ┌─────────────────┬────────────────────────────────────────────────┐
 //  │ Command         │ Expected behavior                              │
 //  ├─────────────────┼────────────────────────────────────────────────┤
 //  │ "AT"            │ Reply "OK". Simplest ping — always works.      │
-//  │ "ATE0"          │ Reply "OK". (Disable echo — we never echo.)    │
+//  │ "ATE0"          │ Reply "OK".    │
 //  │ "AT+CPIN?"      │ If state >= READY:                             │
 //  │                 │   Set state = SIM_READY                        │
 //  │                 │   Reply "+CPIN: READY\r\nOK"                   │
@@ -561,28 +561,100 @@ static void handle_ipv4_packet(sim_modem_config_t *config,
         unsigned short dst_port = ((unsigned short)udp[2] << 8) | udp[3];
 
         if (dst_port == 53 && ip_len >= (size_t)(ip_hdr_len + 8 + 12)) {
-            // Minimal DNS response: return 10.0.0.1 for any A-record query.
+            // DNS query detected — build a canned response returning 10.0.0.1
+            // for any A-record query.
+            //
+            // DNS message layout (inside UDP payload):
+            //   [0:2, txn ID] [2:4, flags] [4:6, qdcount] [6:8, ancount]
+            //   [8:10, nscount] [10:12, arcount] [12:..., question section]
+            //   [..., answer section (we append this)]
             const unsigned char *dns = &udp[8];
             unsigned short txn_id = ((unsigned short)dns[0] << 8) | dns[1];
 
-            // Build a canned DNS response with one A record.
-            const unsigned char peer_ip[] = SIM_MODEM_IP;
-            unsigned char dns_resp[] = {
-                (unsigned char)(txn_id >> 8), (unsigned char)(txn_id & 0xFF),
-                0x81, 0x80,         // Flags: standard response, no error
-                0x00, 0x01,         // Questions: 1
-                0x00, 0x01,         // Answers: 1
-                0x00, 0x00, 0x00, 0x00  // Authority/Additional: 0
-            };
+            // Measure the question section: walk QNAME labels until null terminator,
+            // then skip QTYPE(2) + QCLASS(2).
+            size_t dns_payload_len = ip_len - ip_hdr_len - 8;
+            size_t qname_start = 12;
+            size_t pos = qname_start;
+            while (pos < dns_payload_len && dns[pos] != 0) {
+                pos += 1 + dns[pos];
+            }
+            pos++;           // skip null terminator
+            pos += 4;        // skip QTYPE(2) + QCLASS(2)
+            size_t question_len = pos - qname_start;
 
-            // For simplicity, echo the query section and append a pointer answer.
-            // Real DNS would copy the question + add answer RR. This is a stub.
-            // TODO: copy actual question bytes and construct proper answer RR.
+            // Build response: DNS header + echoed question + answer RR.
+            // Answer RR uses a name pointer (0xC00C) back to the question's QNAME.
+            //   [0:2, 0xC00C name pointer] [2:4, type=A(1)] [4:6, class=IN(1)]
+            //   [6:10, TTL=60s] [10:12, rdlength=4] [12:16, IPv4 addr]
+            const unsigned char modem_ip[] = SIM_MODEM_IP;
+            unsigned char dns_resp[256];
+            size_t dr = 0;
 
-            ESP_LOGI(TAG, "DNS query received (txn=0x%04X) — stub response (not yet complete)",
-                     txn_id);
-            (void)dns_resp;
-            (void)peer_ip;
+            // DNS header: same txn ID, response flags, 1 question, 1 answer.
+            dns_resp[dr++] = (unsigned char)(txn_id >> 8);
+            dns_resp[dr++] = (unsigned char)(txn_id & 0xFF);
+            dns_resp[dr++] = 0x81; dns_resp[dr++] = 0x80;
+            dns_resp[dr++] = 0x00; dns_resp[dr++] = 0x01;
+            dns_resp[dr++] = 0x00; dns_resp[dr++] = 0x01;
+            dns_resp[dr++] = 0x00; dns_resp[dr++] = 0x00;
+            dns_resp[dr++] = 0x00; dns_resp[dr++] = 0x00;
+
+            // Echo the question section verbatim.
+            if (qname_start + question_len <= dns_payload_len &&
+                dr + question_len + 16 <= sizeof(dns_resp)) {
+                memcpy(&dns_resp[dr], &dns[qname_start], question_len);
+                dr += question_len;
+
+                // Answer RR: pointer to QNAME + A record with modem's IP.
+                dns_resp[dr++] = 0xC0; dns_resp[dr++] = 0x0C;
+                dns_resp[dr++] = 0x00; dns_resp[dr++] = 0x01;
+                dns_resp[dr++] = 0x00; dns_resp[dr++] = 0x01;
+                dns_resp[dr++] = 0x00; dns_resp[dr++] = 0x00;
+                dns_resp[dr++] = 0x00; dns_resp[dr++] = 0x3C;
+                dns_resp[dr++] = 0x00; dns_resp[dr++] = 0x04;
+                dns_resp[dr++] = modem_ip[0]; dns_resp[dr++] = modem_ip[1];
+                dns_resp[dr++] = modem_ip[2]; dns_resp[dr++] = modem_ip[3];
+
+                // Wrap DNS response in UDP, IP, and PPP headers.
+                // Reuse the incoming packet as a template — swap addresses/ports.
+                unsigned char reply[512];
+                size_t udp_total = 8 + dr;
+                size_t ip_total  = ip_hdr_len + udp_total;
+                if (ip_total > sizeof(reply) - 4) return;
+
+                // PPP header
+                reply[0] = 0xFF; reply[1] = 0x03;
+                reply[2] = 0x00; reply[3] = 0x21;
+
+                // Copy original IP header, swap src/dst.
+                memcpy(&reply[4], ip, ip_hdr_len);
+                unsigned char *rip = &reply[4];
+                unsigned char tmp[4];
+                memcpy(tmp, &rip[12], 4);
+                memcpy(&rip[12], &rip[16], 4);
+                memcpy(&rip[16], tmp, 4);
+                rip[2] = (ip_total >> 8) & 0xFF;
+                rip[3] = ip_total & 0xFF;
+                rip[10] = 0; rip[11] = 0;
+                unsigned short ck = ip_checksum(rip, ip_hdr_len);
+                rip[10] = (ck >> 8) & 0xFF;
+                rip[11] = ck & 0xFF;
+
+                // UDP header: swap ports, set length, zero checksum.
+                unsigned char *rudp = &rip[ip_hdr_len];
+                rudp[0] = udp[2]; rudp[1] = udp[3];
+                rudp[2] = udp[0]; rudp[3] = udp[1];
+                rudp[4] = (udp_total >> 8) & 0xFF;
+                rudp[5] = udp_total & 0xFF;
+                rudp[6] = 0; rudp[7] = 0;
+
+                // DNS payload
+                memcpy(&rudp[8], dns_resp, dr);
+
+                send_ppp_frame(config, reply, 4 + ip_total, ppp_flag);
+                ESP_LOGI(TAG, "DNS response sent (txn=0x%04X → 10.0.0.1)", txn_id);
+            }
         }
 
     // Is this TCP (protocol=6) with enough bytes for the TCP header (20 bytes min after IP header)?
@@ -599,24 +671,157 @@ static void handle_ipv4_packet(sim_modem_config_t *config,
                                 | ((unsigned long)tcp[6] << 8)  | tcp[7];
 
         if (tcp_flags == 0x02) {
-            // SYN received — send SYN-ACK.
+            // SYN received — respond with SYN-ACK to complete step 1 of the
+            // TCP 3-way handshake (SYN → SYN-ACK → ACK).
             ESP_LOGI(TAG, "TCP SYN received: %u.%u.%u.%u:%u → :%u seq=%lu",
                      ip[12], ip[13], ip[14], ip[15],
                      src_port, dst_port, seq_num);
 
-            // TODO: build SYN-ACK packet:
+            // Build SYN-ACK reply:
             //   - Swap src/dst IP and ports
-            //   - Set flags = SYN+ACK (0x12)
-            //   - ack_num = seq_num + 1
-            //   - Pick our own seq_num (e.g. 5000)
-            //   - Compute IP + TCP checksums
-            //   - Wrap in PPP frame and send
-            ESP_LOGI(TAG, "TCP SYN-ACK — stub (not yet complete)");
+            //   - Our seq = 5000 (arbitrary), ack = their seq + 1
+            //   - Flags = SYN+ACK (0x12)
+            //
+            // Reply IP+TCP layout:
+            //   [0:4, PPP hdr] [4:24, IP hdr (swapped IPs)] [24:44, TCP hdr (swapped ports, SYN-ACK)]
+            unsigned char reply[512];
+            size_t tcp_hdr_len = 20;
+            size_t ip_total = ip_hdr_len + tcp_hdr_len;
+            if (ip_total > sizeof(reply) - 4) return;
+
+            // PPP header for IPv4
+            reply[0] = 0xFF; reply[1] = 0x03;
+            reply[2] = 0x00; reply[3] = 0x21;
+
+            // Copy and modify IP header: swap src/dst, set length.
+            memcpy(&reply[4], ip, ip_hdr_len);
+            unsigned char *rip = &reply[4];
+            unsigned char tmp[4];
+            memcpy(tmp, &rip[12], 4);
+            memcpy(&rip[12], &rip[16], 4);
+            memcpy(&rip[16], tmp, 4);
+            rip[2] = (ip_total >> 8) & 0xFF;
+            rip[3] = ip_total & 0xFF;
+            rip[8] = 0x40;  // TTL = 64
+            rip[10] = 0; rip[11] = 0;
+            unsigned short ck = ip_checksum(rip, ip_hdr_len);
+            rip[10] = (ck >> 8) & 0xFF;
+            rip[11] = ck & 0xFF;
+
+            // Build TCP header: swap ports, set SYN-ACK, our seq, their seq+1.
+            // [0:2, src port] [2:4, dst port] [4:8, seq=5000] [8:12, ack=seq+1]
+            // [12:13, data offset=5 words] [13:14, flags=0x12] [14:16, window]
+            // [16:18, checksum] [18:20, urgent=0]
+            unsigned char *rtcp = &rip[ip_hdr_len];
+            unsigned long our_seq = 5000;
+            unsigned long ack_num = seq_num + 1;
+            memset(rtcp, 0, tcp_hdr_len);
+            rtcp[0] = (dst_port >> 8) & 0xFF;
+            rtcp[1] = dst_port & 0xFF;
+            rtcp[2] = (src_port >> 8) & 0xFF;
+            rtcp[3] = src_port & 0xFF;
+            rtcp[4] = (our_seq >> 24) & 0xFF;
+            rtcp[5] = (our_seq >> 16) & 0xFF;
+            rtcp[6] = (our_seq >> 8)  & 0xFF;
+            rtcp[7] = our_seq & 0xFF;
+            rtcp[8]  = (ack_num >> 24) & 0xFF;
+            rtcp[9]  = (ack_num >> 16) & 0xFF;
+            rtcp[10] = (ack_num >> 8)  & 0xFF;
+            rtcp[11] = ack_num & 0xFF;
+            rtcp[12] = 0x50;  // data offset = 5 (20 bytes), no options
+            rtcp[13] = 0x12;  // flags = SYN + ACK
+            rtcp[14] = 0x16; rtcp[15] = 0x80; // window = 5760
+
+            // TCP checksum uses a pseudo-header: src IP, dst IP, zero, proto, TCP length.
+            // [0:4, src IP] [4:8, dst IP] [8:9, zero] [9:10, proto=6] [10:12, TCP len]
+            unsigned char pseudo[12];
+            memcpy(&pseudo[0], &rip[12], 4);
+            memcpy(&pseudo[4], &rip[16], 4);
+            pseudo[8] = 0; pseudo[9] = 6;
+            pseudo[10] = (tcp_hdr_len >> 8) & 0xFF;
+            pseudo[11] = tcp_hdr_len & 0xFF;
+
+            unsigned long tcp_sum = 0;
+            for (int i = 0; i < 12; i += 2)
+                tcp_sum += ((unsigned short)pseudo[i] << 8) | pseudo[i + 1];
+            for (size_t i = 0; i < tcp_hdr_len; i += 2)
+                tcp_sum += ((unsigned short)rtcp[i] << 8) | ((i + 1 < tcp_hdr_len) ? rtcp[i + 1] : 0);
+            while (tcp_sum >> 16)
+                tcp_sum = (tcp_sum & 0xFFFF) + (tcp_sum >> 16);
+            unsigned short tcp_ck = (unsigned short)(~tcp_sum);
+            rtcp[16] = (tcp_ck >> 8) & 0xFF;
+            rtcp[17] = tcp_ck & 0xFF;
+
+            send_ppp_frame(config, reply, 4 + ip_total, ppp_flag);
+            ESP_LOGI(TAG, "TCP SYN-ACK sent (our_seq=%lu, ack=%lu)", our_seq, ack_num);
 
         } else if (tcp_flags & 0x01) {
-            // FIN received.
+            // FIN received — respond with FIN-ACK to close the connection.
+            // Same packet construction pattern as SYN-ACK but with flags=FIN+ACK (0x11).
             ESP_LOGI(TAG, "TCP FIN received from port %u", src_port);
-            // TODO: send FIN-ACK back
+
+            unsigned char reply[512];
+            size_t tcp_hdr_len = 20;
+            size_t ip_total = ip_hdr_len + tcp_hdr_len;
+            if (ip_total > sizeof(reply) - 4) return;
+
+            reply[0] = 0xFF; reply[1] = 0x03;
+            reply[2] = 0x00; reply[3] = 0x21;
+
+            // IP header: swap src/dst.
+            memcpy(&reply[4], ip, ip_hdr_len);
+            unsigned char *rip = &reply[4];
+            unsigned char tmp[4];
+            memcpy(tmp, &rip[12], 4);
+            memcpy(&rip[12], &rip[16], 4);
+            memcpy(&rip[16], tmp, 4);
+            rip[2] = (ip_total >> 8) & 0xFF;
+            rip[3] = ip_total & 0xFF;
+            rip[8] = 0x40;
+            rip[10] = 0; rip[11] = 0;
+            unsigned short ck = ip_checksum(rip, ip_hdr_len);
+            rip[10] = (ck >> 8) & 0xFF;
+            rip[11] = ck & 0xFF;
+
+            // TCP header: swap ports, ack their seq+1, set FIN+ACK.
+            // [13:14, flags=0x11 FIN+ACK]
+            unsigned char *rtcp = &rip[ip_hdr_len];
+            unsigned long ack_num = seq_num + 1;
+            memset(rtcp, 0, tcp_hdr_len);
+            rtcp[0] = (dst_port >> 8) & 0xFF;
+            rtcp[1] = dst_port & 0xFF;
+            rtcp[2] = (src_port >> 8) & 0xFF;
+            rtcp[3] = src_port & 0xFF;
+            rtcp[4] = 0; rtcp[5] = 0; rtcp[6] = 0; rtcp[7] = 1; // seq = 1
+            rtcp[8]  = (ack_num >> 24) & 0xFF;
+            rtcp[9]  = (ack_num >> 16) & 0xFF;
+            rtcp[10] = (ack_num >> 8)  & 0xFF;
+            rtcp[11] = ack_num & 0xFF;
+            rtcp[12] = 0x50;
+            rtcp[13] = 0x11;  // FIN + ACK
+            rtcp[14] = 0x16; rtcp[15] = 0x80;
+
+            // TCP checksum with pseudo-header.
+            unsigned char pseudo[12];
+            memcpy(&pseudo[0], &rip[12], 4);
+            memcpy(&pseudo[4], &rip[16], 4);
+            pseudo[8] = 0; pseudo[9] = 6;
+            pseudo[10] = (tcp_hdr_len >> 8) & 0xFF;
+            pseudo[11] = tcp_hdr_len & 0xFF;
+
+            unsigned long tcp_sum = 0;
+            for (int i = 0; i < 12; i += 2)
+                tcp_sum += ((unsigned short)pseudo[i] << 8) | pseudo[i + 1];
+            for (size_t i = 0; i < tcp_hdr_len; i += 2)
+                tcp_sum += ((unsigned short)rtcp[i] << 8) | ((i + 1 < tcp_hdr_len) ? rtcp[i + 1] : 0);
+            while (tcp_sum >> 16)
+                tcp_sum = (tcp_sum & 0xFFFF) + (tcp_sum >> 16);
+            unsigned short tcp_ck = (unsigned short)(~tcp_sum);
+            rtcp[16] = (tcp_ck >> 8) & 0xFF;
+            rtcp[17] = tcp_ck & 0xFF;
+
+            send_ppp_frame(config, reply, 4 + ip_total, ppp_flag);
+            ESP_LOGI(TAG, "TCP FIN-ACK sent (ack=%lu)", ack_num);
         } else {
             ESP_LOGI(TAG, "TCP segment: flags=0x%02X src_port=%u dst_port=%u",
                      tcp_flags, src_port, dst_port);
