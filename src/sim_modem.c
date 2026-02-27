@@ -8,6 +8,10 @@
 
 static const char *TAG = "SIM_MODEM";
 
+// Real modems default to echo ON (ATE1). Every character the driver sends is
+// echoed back before the modem's actual response. ATE0 disables this.
+static int echo_enabled = 1;
+
 // ============================================================================
 //  INTERNAL HELPERS
 // ============================================================================
@@ -18,14 +22,18 @@ static const char *TAG = "SIM_MODEM";
 //  Sends a string back to the driver over the modem's UART TX.
 //  All modem responses end with \r\n.
 //
-//  TODO:
 //    1. Use uart_write_bytes() to send the response string
 //    2. Append \r\n after the response
 //    3. (Optional) Add a small delay to simulate real modem response latency
 // ---------------------------------------------------------------------------
 static void send_response(sim_modem_config_t *config, const char *response)
 {
-    // TODO: implement
+    // What goes on the wire: "\r\n" + response text + "\r\n"
+    // Real modems prefix responses with \r\n so the driver can distinguish
+    // modem output from echoed commands.
+    uart_write_bytes(config->uart_num, "\r\n", 2);
+    uart_write_bytes(config->uart_num, response, strlen(response));
+    uart_write_bytes(config->uart_num, "\r\n", 2);
 }
 
 // ---------------------------------------------------------------------------
@@ -34,7 +42,6 @@ static void send_response(sim_modem_config_t *config, const char *response)
 //  Reads bytes from UART RX until a line terminator ('\r' or '\n') is found.
 //  Returns the number of bytes read (excluding the terminator).
 //
-//  TODO:
 //    1. Read one byte at a time from UART using uart_read_bytes() with a timeout
 //    2. Accumulate into the provided buffer
 //    3. Stop when '\r' or '\n' is received, or buffer is full
@@ -44,8 +51,37 @@ static void send_response(sim_modem_config_t *config, const char *response)
 static int read_line(sim_modem_config_t *config, char *buf, size_t buf_size,
                      TickType_t timeout)
 {
-    // TODO: implement
-    return -1;
+    // Read one byte at a time, accumulating into buf until we hit a line
+    // terminator ('\r' or '\n') or run out of space/time.
+    // AT commands are always single-line, terminated by '\r' from the driver.
+    size_t pos = 0;
+
+    while (pos < buf_size - 1) {
+        unsigned char c;
+        // Block on each byte up to the caller's timeout.
+        int got = uart_read_bytes(config->uart_num, &c, 1, timeout);
+
+        // No byte arrived within timeout — return what we have (or -1 if empty).
+        if (got <= 0) {
+            return (pos > 0) ? (int)pos : -1;
+        }
+
+        // '\r' or '\n' marks end of command — don't store the terminator.
+        if (c == '\r' || c == '\n') {
+            if (pos == 0) {
+                // Leading blank line (e.g. the '\n' after a '\r') — skip it.
+                continue;
+            }
+            break;
+        }
+
+        // Accumulate printable command bytes.
+        buf[pos++] = (char)c;
+    }
+
+    // Null-terminate so strcmp/strncmp work in handle_at_command.
+    buf[pos] = '\0';
+    return (int)pos;
 }
 
 // ---------------------------------------------------------------------------
@@ -93,16 +129,90 @@ static sim_modem_state_t handle_at_command(sim_modem_config_t *config,
 {
     ESP_LOGI(TAG, "RX cmd: \"%s\" (state=%d)", cmd, config->state);
 
-    // TODO: implement command dispatch table
-    //
-    // Skeleton:
-    //   if (strcmp(cmd, "AT") == 0) {
-    //       send_response(config, "OK");
-    //   } else if (strcmp(cmd, "AT+CPIN?") == 0) {
-    //       ...
-    //   } else {
-    //       send_response(config, "ERROR");
-    //   }
+    // Echo the command back before responding, just like real modem hardware.
+    // The driver sees its own command repeated, then the modem's response.
+    if (echo_enabled) {
+        uart_write_bytes(config->uart_num, cmd, strlen(cmd));
+        uart_write_bytes(config->uart_num, "\r\n", 2);
+    }
+
+    // Ping — always valid, proves the modem is alive.
+    if (strcmp(cmd, "AT") == 0) {
+        send_response(config, "OK");
+
+    // ATE0 — disable echo. Driver won't see its commands repeated anymore.
+    } else if (strcmp(cmd, "ATE0") == 0) {
+        echo_enabled = 0;
+        send_response(config, "OK");
+
+    // ATE1 — re-enable echo (back to default behavior).
+    } else if (strcmp(cmd, "ATE1") == 0) {
+        echo_enabled = 1;
+        send_response(config, "OK");
+
+    // SIM status — transitions modem from READY → SIM_READY.
+    } else if (strcmp(cmd, "AT+CPIN?") == 0) {
+        if (config->state >= SIM_MODEM_STATE_READY) {
+            config->state = SIM_MODEM_STATE_SIM_READY;
+            send_response(config, "+CPIN: READY\r\nOK");
+        } else {
+            send_response(config, "ERROR");
+        }
+
+    // Signal quality — always report good signal (RSSI=20, BER=0).
+    } else if (strcmp(cmd, "AT+CSQ") == 0) {
+        send_response(config, "+CSQ: 20,0\r\nOK");
+
+    // Network registration — transitions SIM_READY → REGISTERED.
+    } else if (strcmp(cmd, "AT+CREG?") == 0) {
+        if (config->state >= SIM_MODEM_STATE_SIM_READY) {
+            config->state = SIM_MODEM_STATE_REGISTERED;
+            send_response(config, "+CREG: 0,1\r\nOK"); // Not sending unsolicited updates, registered
+        } else {
+            send_response(config, "+CREG: 0,0\r\nOK"); // Not sending unsolicitied updates, unregistered
+        }
+
+    // EPS registration — same behavior as CREG for our purposes.
+    } else if (strcmp(cmd, "AT+CEREG?") == 0) {
+        if (config->state >= SIM_MODEM_STATE_SIM_READY) {
+            config->state = SIM_MODEM_STATE_REGISTERED;
+            send_response(config, "+CEREG: 0,1\r\nOK");
+        } else {
+            send_response(config, "+CEREG: 0,0\r\nOK");
+        }
+
+    // Operator query — report fake operator name.
+    } else if (strcmp(cmd, "AT+COPS?") == 0) {
+        send_response(config, "+COPS: 0,0,\"Fake Cellular\"\r\nOK");
+
+    // Define PDP context — accept any APN, just acknowledge.
+    } else if (strncmp(cmd, "AT+CGDCONT=", 11) == 0) {
+        send_response(config, "OK");
+
+    // Activate PDP context — transitions REGISTERED → PDP_ACTIVE.
+    } else if (strcmp(cmd, "AT+CGACT=1,1") == 0) {
+        if (config->state >= SIM_MODEM_STATE_REGISTERED) {
+            config->state = SIM_MODEM_STATE_PDP_ACTIVE;
+            send_response(config, "OK");
+        } else {
+            send_response(config, "ERROR");
+        }
+
+    // Dial PPP — transitions PDP_ACTIVE → DATA_MODE.
+    // After CONNECT, UART switches from AT text to binary PPP frames.
+    } else if (strcmp(cmd, "ATD*99#") == 0) {
+        if (config->state == SIM_MODEM_STATE_PDP_ACTIVE) {
+            send_response(config, "CONNECT 115200");
+            config->state = SIM_MODEM_STATE_DATA_MODE;
+        } else {
+            send_response(config, "NO CARRIER");
+        }
+
+    // Unknown command — real modems respond with ERROR.
+    } else {
+        ESP_LOGW(TAG, "Unknown AT command: \"%s\"", cmd);
+        send_response(config, "ERROR");
+    }
 
     return config->state;
 }
@@ -133,9 +243,14 @@ static void send_ppp_frame(sim_modem_config_t *config,
                            const unsigned char *frame, size_t len,
                            unsigned char ppp_flag)
 {
-    uart_write_bytes(config->uart_num, (const char *)&ppp_flag, 1);
-    uart_write_bytes(config->uart_num, (const char *)frame, len);
-    uart_write_bytes(config->uart_num, (const char *)&ppp_flag, 1);
+    // What goes on the wire (Transmit sequence):
+    //   [0:1, 0x7E flag (frame start)] [1:1+len, frame payload] [1+len:2+len, 0x7E flag (frame end)]
+    //
+    // Payload itself is structured by whatever calls it:
+    //   [0:1, 0xFF addr] [1:2, 0x03 ctrl] [2:4, protocol ID] [4:len, protocol-specific data]
+    uart_write_bytes(config->uart_num, (const char *)&ppp_flag, 1);  // opening delimiter
+    uart_write_bytes(config->uart_num, (const char *)frame, len);    // payload (addr+ctrl+proto+data)
+    uart_write_bytes(config->uart_num, (const char *)&ppp_flag, 1);  // closing delimiter
 }
 
 // ---------------------------------------------------------------------------
@@ -162,6 +277,17 @@ static unsigned short ip_checksum(const unsigned char *data, size_t len)
 //  handle_lcp_frame  (Step 3)
 //  After ATD*99# enters DATA_MODE, LCP is the first PPP control protocol.
 //  Must complete before IPCP can assign IP addresses.
+//
+//  Vocab:
+//    - Config-Request: the driver proposing its desired link parameters
+//      to the modem and asking the modem to accept or reject them.
+//    - Config-Ack: the modem's response saying "I accept all your
+//      proposed parameters." Built by echoing the request back with
+//      code changed from 0x01 to 0x02.
+//    - Link parameters: settings that govern the PPP link itself, e.g.
+//      MRU (max receive unit / max packet size), authentication method
+//      (PAP/CHAP), and protocol compression. Negotiated before any IP
+//      traffic can flow.
 // ---------------------------------------------------------------------------
 static void handle_lcp_frame(sim_modem_config_t *config,
                              const unsigned char *frame_buf,
@@ -180,11 +306,17 @@ static void handle_lcp_frame(sim_modem_config_t *config,
         unsigned char lcp_id = lcp[1];
         unsigned short lcp_len = ((unsigned short)lcp[2] << 8) | lcp[3];
 
+        // If: Is this a Config-Request (0x01), with a valid length, that fits in the frame?
         if (lcp_code == 0x01 && lcp_len >= 4 && (4U + lcp_len) <= frame_len) {
+            // Condition met:
+            // The driver sent us its desired PPP link settings.
+            // We accept them (send Ack) and then reply (send our own Config-Request).
             unsigned char ack_frame[512];
             size_t ack_len = 4U + lcp_len;
 
+            // Send data:
             // Build LCP Config-Ack by echoing requester options.
+            // [0:1, 0xFF addr] [1:2, 0x03 ctrl] [2:4, 0xC021 LCP proto] [4:4+lcp_len, driver's options echoed back with code=0x02]
             ack_frame[0] = 0xFF;
             ack_frame[1] = 0x03;
             ack_frame[2] = 0xC0;
@@ -197,7 +329,9 @@ static void handle_lcp_frame(sim_modem_config_t *config,
             ESP_LOGI(TAG, "LCP Config-Ack sent (id=%u, len=%u)",
                      (unsigned int)lcp_id, (unsigned int)lcp_len);
 
+            // Send data:
             // Send our own LCP Config-Request (MRU option = 1500 / 0x05DC).
+            // [0:4, 0xFF/0x03/0xC021 PPP hdr] [4:5, 0x01 Config-Request] [5:6, id] [6:8, length=8] [8:12, MRU option: type=0x01 len=4 val=0x05DC]
             static unsigned char local_lcp_id = 0x40;
             unsigned char req_frame[] = {
                 0xFF, 0x03, 0xC0, 0x21,
@@ -221,6 +355,19 @@ static void handle_lcp_frame(sim_modem_config_t *config,
 //  handle_ipcp_frame  (Step 4)
 //  After LCP opens, IPCP assigns IP addresses. This is the PPP equivalent
 //  of DHCP — the modem tells the driver what IP to use.
+//
+//  Vocab:
+//    - IPCP: Internet Protocol Control Protocol. Runs inside PPP (proto
+//      0x8021) to negotiate Layer 3 parameters before IP traffic flows.
+//    - Config-Nak: "I reject the value you proposed, use this instead."
+//      Sent when the driver requests IP 0.0.0.0 (meaning "assign me one").
+//      The modem Naks with the IP it wants the driver to use (10.0.0.2).
+//    - Config-Ack: "I accept your proposed value." Sent when the driver
+//      re-requests with the correct IP after being Nak'd.
+//    - IP-Address option (type 0x03): the IPCP option that carries the
+//      proposed IP address. 6 bytes: type(1) + len(1) + IPv4 addr(4).
+//    - Primary/Secondary DNS (types 0x81/0x83): IPCP options for DNS
+//      server addresses. The modem proposes these in its own Config-Request.
 // ---------------------------------------------------------------------------
 static void handle_ipcp_frame(sim_modem_config_t *config,
                               const unsigned char *frame_buf,
@@ -239,21 +386,27 @@ static void handle_ipcp_frame(sim_modem_config_t *config,
     unsigned char id   = ipcp[1];
     unsigned short ipcp_len = ((unsigned short)ipcp[2] << 8) | ipcp[3];
 
+    // Is this a valid Config-Request (code 0x01) that fits in the frame?
     if (code == 0x01 && ipcp_len >= 4 && (4U + ipcp_len) <= frame_len) {
-        // IPCP Config-Request from driver.
-        // Scan options for IP address (option type 0x03, length 6).
+        // The driver is requesting an IP address from us.
+        // Scan its options looking for the IP-Address option (type 0x03, 6 bytes).
         const unsigned char peer_ip[] = SIM_PEER_IP;
         const unsigned char *opt = &ipcp[4];
         size_t opt_remaining = ipcp_len - 4;
         int ip_option_ok = 0;
 
+        // Walk the IPCP options TLV chain. Each option is:
+        //   [0:1, type] [1:2, length (includes type+len bytes)] [2:length, value]
+        // We're looking for type=0x03 (IP-Address), length=6, value=4-byte IPv4.
+        // If the driver proposes 10.0.0.2 (our intended peer IP), we Ack.
+        // If it proposes 0.0.0.0 or anything else, we Nak with 10.0.0.2.
         while (opt_remaining >= 2) {
             unsigned char opt_type = opt[0];
             unsigned char opt_len  = opt[1];
             if (opt_len < 2 || opt_len > opt_remaining) break;
 
             if (opt_type == 0x03 && opt_len == 6) {
-                // IP-Address option: check if peer is requesting the IP we want to assign.
+                // Found the IP-Address option — does it match the IP we want to assign?
                 if (memcmp(&opt[2], peer_ip, 4) == 0) {
                     ip_option_ok = 1;
                 }
@@ -263,7 +416,8 @@ static void handle_ipcp_frame(sim_modem_config_t *config,
         }
 
         if (ip_option_ok) {
-            // Peer requested the correct IP — send Config-Ack.
+            // Driver requested the IP we want to assign — accept it.
+            // [0:4, 0xFF/0x03/0x8021 PPP hdr] [4:4+ipcp_len, driver's options echoed back with code=0x02]
             unsigned char ack[512];
             size_t ack_len = 4U + ipcp_len;
             ack[0] = 0xFF; ack[1] = 0x03;
@@ -274,7 +428,8 @@ static void handle_ipcp_frame(sim_modem_config_t *config,
             send_ppp_frame(config, ack, ack_len, ppp_flag);
             ESP_LOGI(TAG, "IPCP Config-Ack sent (peer IP 10.0.0.2 accepted)");
         } else {
-            // Peer requested wrong/zero IP — send Config-Nak with the IP we want to assign.
+            // Driver requested 0.0.0.0 or wrong IP — Nak with the IP we want to assign.
+            // [0:4, PPP hdr] [4:5, 0x03 Config-Nak] [5:6, id] [6:8, len] [8:14, IP-Address option with 10.0.0.2]
             unsigned char nak[] = {
                 0xFF, 0x03, 0x80, 0x21,
                 0x03, id, 0x00, 0x0A,
@@ -285,7 +440,8 @@ static void handle_ipcp_frame(sim_modem_config_t *config,
             ESP_LOGI(TAG, "IPCP Config-Nak sent (suggesting 10.0.0.2)");
         }
 
-        // Send our own IPCP Config-Request with modem's IP and DNS.
+        // Send our own IPCP Config-Request: propose modem's IP + DNS servers.
+        // [0:4, PPP hdr] [4:5, 0x01 Config-Req] [5:6, id] [6:8, len=22] [8:14, IP opt 10.0.0.1] [14:20, DNS1 opt] [20:26, DNS2 opt]
         const unsigned char modem_ip[] = SIM_MODEM_IP;
         const unsigned char dns_ip[]   = SIM_DNS_IP;
         static unsigned char local_ipcp_id = 0x60;
@@ -312,6 +468,19 @@ static void handle_ipcp_frame(sim_modem_config_t *config,
 //  handle_ipv4_packet  (Steps 5 & 6)
 //  After IPCP opens, real IP packets arrive wrapped in PPP frames.
 //  Extract IP header, dispatch by protocol: ICMP, UDP (DNS), TCP.
+//
+//  Vocab:
+//    - IPv4 header: 20+ bytes at start of every IP packet. Contains
+//      protocol (byte 9: 1=ICMP, 6=TCP, 17=UDP), src/dst IPs (bytes
+//      12-19), total length, checksum, and header length.
+//    - ICMP Echo Request/Reply: ping. Type 8 = request, type 0 = reply.
+//      We swap src/dst IPs, change type to 0, recompute checksums.
+//    - UDP: connectionless datagrams. We check dst port 53 for DNS.
+//    - DNS: query/response over UDP port 53. Transaction ID ties a
+//      response to its query. We return a canned A record.
+//    - TCP: connection-oriented. SYN (flags=0x02) starts 3-way handshake.
+//      SYN-ACK (flags=0x12) is the server's reply. FIN (flags=0x01)
+//      closes the connection.
 // ---------------------------------------------------------------------------
 static void handle_ipv4_packet(sim_modem_config_t *config,
                                const unsigned char *frame_buf,
@@ -319,6 +488,8 @@ static void handle_ipv4_packet(sim_modem_config_t *config,
                                unsigned char ppp_flag)
 {
     // IP packet starts at frame_buf[4] (after PPP addr/ctrl/proto).
+    // PPP frame layout: [0:4, 0xFF/0x03/0x0021 PPP hdr] [4:frame_len, IPv4 packet]
+    // IPv4 header:       [0:1, ver+hdr_len] [2:4, total_len] [9:10, protocol] [12:16, src IP] [16:20, dst IP]
     const unsigned char *ip = &frame_buf[4];
     size_t ip_len = frame_len - 4;
 
@@ -327,19 +498,22 @@ static void handle_ipv4_packet(sim_modem_config_t *config,
         return;
     }
 
+    // Parse the fields we need for dispatching and response construction.
     unsigned char ip_hdr_len = (ip[0] & 0x0F) * 4;
     unsigned short total_len = ((unsigned short)ip[2] << 8) | ip[3];
     unsigned char protocol   = ip[9];
-    // src IP = ip[12..15], dst IP = ip[16..19]
 
     ESP_LOGI(TAG, "IPv4 packet: proto=%u, len=%u, src=%u.%u.%u.%u, dst=%u.%u.%u.%u",
              protocol, total_len,
              ip[12], ip[13], ip[14], ip[15],
              ip[16], ip[17], ip[18], ip[19]);
 
+    // Is this ICMP (protocol=1) with enough bytes for the ICMP header (8 bytes after IP header)?
     if (protocol == 1 && ip_len >= (size_t)(ip_hdr_len + 8)) {
         // Step 6a: ICMP — respond to echo request (ping).
+        // ICMP header: [0:1, type] [1:2, code] [2:4, checksum] [4:8, id+seq]
         const unsigned char *icmp = &ip[ip_hdr_len];
+        // Type 8 = Echo Request (ping), Type 0 = Echo Reply (pong).
         if (icmp[0] == 8) {
             // Build ICMP Echo Reply: swap src/dst IP, set type=0, fix checksums.
             unsigned char reply[512];
@@ -378,8 +552,11 @@ static void handle_ipv4_packet(sim_modem_config_t *config,
             ESP_LOGI(TAG, "ICMP Echo Reply sent");
         }
 
+    // Is this UDP (protocol=17) with enough bytes for the UDP header (8 bytes after IP header)?
     } else if (protocol == 17 && ip_len >= (size_t)(ip_hdr_len + 8)) {
         // Step 6b: UDP — check for DNS queries (dst port 53).
+        // UDP header: [0:2, src port] [2:4, dst port] [4:6, length] [6:8, checksum]
+        // DNS payload starts at udp[8].
         const unsigned char *udp = &ip[ip_hdr_len];
         unsigned short dst_port = ((unsigned short)udp[2] << 8) | udp[3];
 
@@ -408,8 +585,11 @@ static void handle_ipv4_packet(sim_modem_config_t *config,
             (void)peer_ip;
         }
 
+    // Is this TCP (protocol=6) with enough bytes for the TCP header (20 bytes min after IP header)?
     } else if (protocol == 6 && ip_len >= (size_t)(ip_hdr_len + 20)) {
         // Step 6c: TCP — detect SYN and perform 3-way handshake stub.
+        // TCP header: [0:2, src port] [2:4, dst port] [4:8, seq num] [8:12, ack num] [13:14, flags]
+        // Flags: SYN=0x02, ACK=0x10, SYN+ACK=0x12, FIN=0x01, RST=0x04
         const unsigned char *tcp = &ip[ip_hdr_len];
         unsigned char tcp_flags = tcp[13];
 
