@@ -139,11 +139,61 @@ static sim_modem_state_t handle_at_command(sim_modem_config_t *config,
 // ---------------------------------------------------------------------------
 static void handle_ppp_data_mode(sim_modem_config_t *config)
 {
-    ESP_LOGI(TAG, "Entered PPP data mode — not yet implemented");
+    // We keep this handler byte-oriented (not line-oriented) because PPP is
+    // binary and may contain arbitrary bytes.
+    static const unsigned char PPP_FLAG = 0x7E;
+    unsigned char byte = 0;
+    unsigned char frame_buf[512];
+    size_t frame_len = 0;
 
-    // TODO: replace with PPP frame handler
+    ESP_LOGI(TAG, "Entered PPP data mode — collecting HDLC frames");
+
     while (config->state == SIM_MODEM_STATE_DATA_MODE) {
-        vTaskDelay(pdMS_TO_TICKS(1000));
+        // Busy wait for bytes
+        int got = uart_read_bytes(config->uart_num, &byte, 1, pdMS_TO_TICKS(200));
+        if (got <= 0) {
+            // Idle timeout: no bytes right now, keep waiting.
+            continue;
+        }
+
+        // Step 1: Read raw bytes from UART (PPP is binary, not line-based).
+        if (byte == PPP_FLAG) {
+            // Step 2: PPP frame delimiter 0x7E found (HDLC flag bytes).
+            // This marks frame boundary. Consecutive flags are legal and
+            // represent empty fill between frames, so ignore zero-length frames.
+            if (frame_len == 0) {
+                continue;
+            }
+
+            // Frame boundary reached — we now have one complete PPP frame.
+            // PPP header is usually: Address(0xFF), Control(0x03), Protocol(2B).
+            if (frame_len >= 4 && frame_buf[0] == 0xFF && frame_buf[1] == 0x03) {
+                unsigned short protocol = ((unsigned short)frame_buf[2] << 8) | frame_buf[3];
+                if (protocol == 0xC021) {
+                    ESP_LOGI(TAG, "PPP frame complete: LCP (len=%u)", (unsigned int)frame_len);
+                    // TODO Step 3a: parse LCP Config-Request and send Config-Ack.
+                } else {
+                    ESP_LOGI(TAG, "PPP frame complete: proto=0x%04X (len=%u)",
+                             protocol, (unsigned int)frame_len);
+                }
+            } else {
+                ESP_LOGW(TAG, "PPP frame complete but too short/unknown header (len=%u)",
+                         (unsigned int)frame_len);
+            }
+
+            // Ready for next frame.
+            frame_len = 0;
+            continue;
+        }
+
+        // Accumulate frame bytes until the next 0x7E delimiter.
+        if (frame_len < sizeof(frame_buf)) {
+            frame_buf[frame_len++] = byte;
+        } else {
+            // Overflow guard: drop this frame and wait for next delimiter.
+            ESP_LOGW(TAG, "PPP frame overflow; dropping partial frame");
+            frame_len = 0;
+        }
     }
 }
 
@@ -154,27 +204,47 @@ static void handle_ppp_data_mode(sim_modem_config_t *config)
 
 void sim_modem_init(sim_modem_config_t *config)
 {
-    // TODO:
-    //   1. Set config->state = SIM_MODEM_STATE_OFF
-    //   2. Populate a uart_config_t struct:
-    //        .baud_rate           = config->baud_rate
-    //        .data_bits           = UART_DATA_8_BITS
-    //        .parity              = UART_PARITY_DISABLE
-    //        .stop_bits           = UART_STOP_BITS_1
-    //        .flow_ctrl           = config->flow_control
-    //                               ? UART_HW_FLOWCTRL_CTS_RTS
-    //                               : UART_HW_FLOWCTRL_DISABLE
-    //        .rx_flow_ctrl_thresh = 122  (only matters when flow_control=true)
-    //   3. Call uart_param_config(config->uart_num, &uart_cfg)
-    //   4. Call uart_set_pin(config->uart_num,
-    //                        config->tx_pin, config->rx_pin,
-    //                        config->rts_pin, config->cts_pin)
-    //      When flow control is disabled, rts_pin/cts_pin are
-    //      UART_PIN_NO_CHANGE — the UART ignores them.
-    //   5. Call uart_driver_install(config->uart_num,
-    //                               RX_BUF_SIZE, TX_BUF_SIZE, 0, NULL, 0)
-    //
-    //   Suggested buffer sizes: 1024 for RX, 1024 for TX
+    // 1. Set initial state to OFF so the task knows the modem hasn't booted yet.
+    //    The sim_modem_task will delay (power-on) then transition to READY before
+    //    accepting AT commands — the driver must not send until the modem is READY.
+    config->state = SIM_MODEM_STATE_OFF;
+
+    // 2. Describe the UART's electrical parameters: baud rate, word format,
+    //    and flow control. This struct doesn't touch hardware yet — it's just
+    //    a settings object that uart_param_config() will apply to the peripheral.
+    //    8N1 (8 data bits, no parity, 1 stop bit) is the universal default for
+    //    AT command interfaces — every cellular modem uses it.
+    uart_config_t uart_cfg = {
+        .baud_rate           = config->baud_rate,
+        .data_bits           = UART_DATA_8_BITS, // <-- various defined types in uart.h
+        .parity              = UART_PARITY_DISABLE,
+        .stop_bits           = UART_STOP_BITS_1,
+        .flow_ctrl           = config->flow_control
+                                   ? UART_HW_FLOWCTRL_CTS_RTS
+                                   : UART_HW_FLOWCTRL_DISABLE,
+        .rx_flow_ctrl_thresh = 122,
+    };
+
+    // 3. Apply the config to the UART peripheral registers. After this call,
+    //    the hardware knows the baud rate, word format, and flow control mode,
+    //    but no pins are assigned yet and no driver buffers exist — the UART
+    //    can't actually send or receive until steps 4 and 5 complete.
+    uart_param_config(config->uart_num, &uart_cfg);
+
+    // 4. Route the UART's TX, RX, RTS, and CTS signals to physical GPIO pins
+    //    via the ESP32's GPIO matrix. Without this, the UART has no electrical
+    //    connection — bytes written would go nowhere. When flow control is off,
+    //    rts_pin and cts_pin are -1 (UART_PIN_NO_CHANGE), so those signals
+    //    stay unconnected and the UART ignores them.
+    uart_set_pin(config->uart_num,
+                 config->tx_pin, config->rx_pin,
+                 config->rts_pin, config->cts_pin);
+
+    // 5. Install the UART driver: allocate RX and TX ring buffers (1024-byte) 
+    //    and register the driver with the ESP-IDF UART layer. This call allows uart_*
+    //    read/write calls to be used, which abstracts away the direct register reading
+    //    and polling you have to do to read from UART otherwise
+    uart_driver_install(config->uart_num, 1024, 1024, 0, NULL, 0);
 
     ESP_LOGI(TAG, "sim_modem_init: uart=%d tx=%d rx=%d baud=%d",
              config->uart_num, config->tx_pin, config->rx_pin,
@@ -187,35 +257,41 @@ void sim_modem_task(void *param)
     char line_buf[256];
 
     // -----------------------------------------------------------------------
-    // Step 1: Simulate modem power-on sequence
-    //   TODO:
-    //     - Delay 1-2 seconds (modem boot time)
-    //     - Set state = SIM_MODEM_STATE_READY
-    //     - Log "Modem powered on"
+    // Step 1: Simulate modem power-on sequence.
+    // Real modems need time before they can accept AT commands, so we emulate
+    // that boot window to keep driver timing behavior realistic.
     // -----------------------------------------------------------------------
-
-    // -----------------------------------------------------------------------
-    // Step 2: Main AT command loop
-    //   TODO:
-    //     - While state != DATA_MODE:
-    //         a. Call read_line() to get the next command from the driver
-    //         b. If read timed out, continue (maybe send a URC periodically)
-    //         c. Call handle_at_command() with the received line
-    //         d. Update state from the return value
-    //     - When state transitions to DATA_MODE, break out of this loop
-    // -----------------------------------------------------------------------
-
-    // -----------------------------------------------------------------------
-    // Step 3: Enter PPP data mode
-    //   TODO:
-    //     - Call handle_ppp_data_mode()
-    //     - If we ever exit data mode (e.g. +++ escape), loop back to Step 2
-    // -----------------------------------------------------------------------
+    vTaskDelay(pdMS_TO_TICKS(1500));
+    config->state = SIM_MODEM_STATE_READY;
+    ESP_LOGI(TAG, "Modem powered on, state=READY");
 
     ESP_LOGI(TAG, "sim_modem_task started");
 
-    // TODO: implement the flow above
     while (1) {
-        vTaskDelay(pdMS_TO_TICKS(1000));
+        // -------------------------------------------------------------------
+        // Step 2: Main AT command loop
+        // Keep servicing AT commands until the modem is told to switch into
+        // PPP data mode (ATD*99#). A read timeout is normal when idle.
+        // -------------------------------------------------------------------
+        while (config->state != SIM_MODEM_STATE_DATA_MODE) {
+            // Basically busy wait for commands
+            int line_len = read_line(config, line_buf, sizeof(line_buf), pdMS_TO_TICKS(500));
+
+            // Test if command found this cycle
+            if (line_len <= 0) {
+                // Timeout/no data: stay responsive but do nothing this cycle.
+                continue;
+            }
+
+            // Handle command
+            config->state = handle_at_command(config, line_buf);
+        }
+
+        // -------------------------------------------------------------------
+        // Step 3: Enter PPP data mode.
+        // This function blocks while in DATA_MODE. If it returns (e.g. because
+        // an escape sequence switched state), we loop back to Step 2.
+        // -------------------------------------------------------------------
+        handle_ppp_data_mode(config);
     }
 }
