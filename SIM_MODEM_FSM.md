@@ -3,6 +3,8 @@
 Every state, transition, branch, input, and output in `sim_modem.c`,
 documented as a formal finite state machine.
 
+**Note:** All states are held in `config->state` inside the sim_modem; this is internal to the sim only. The modem driver never sees it and infers modem state from AT responses (e.g. OK, +CPIN: READY, +CREG: 0,1, CONNECT).
+
 ---
 
 ## Top-Level State Enum
@@ -18,7 +20,20 @@ SIM_MODEM_STATE_DATA_MODE  → PPP binary frames on UART (no more AT)
 
 ---
 
+## Step-by-step overview (what actually happens)
+
+1. **S0 → S1:** Init sets state OFF and configures UART; the task runs a 1.5s boot delay, then sets state READY and enters the AT loop.
+2. **S1 (READY):** Modem reads text lines, echoes (if on), and replies to AT commands. Only AT+CPIN? causes a state change → SIM_READY.
+3. **S2 (SIM_READY):** Same as READY, but AT+CREG?/AT+CEREG? now return “registered”; when the driver sends one of these → REGISTERED.
+4. **S3 (REGISTERED):** Driver sends AT+CGACT=1,1; we respond OK → PDP_ACTIVE.
+5. **S4 (PDP_ACTIVE):** Driver sends ATD*99#; we respond CONNECT and set state DATA_MODE; the AT loop exits and we enter handle_ppp_data_mode().
+6. **S5 (DATA_MODE):** We read raw bytes, detect 0x7E frames and +++ escape. LCP (S5.3) and IPCP (S5.4) set up the link and IPs; IPv4 (S5.5) handles ping, DNS, and TCP SYN/FIN. When +++ is detected with guard time, state goes back to PDP_ACTIVE and we return to the AT loop.
+
+---
+
 ## S0: OFF (Initial State)
+
+**High-level:** The modem is not running yet. Init has set state to OFF and configured the UART (baud, pins, flow control, driver install). The task may not have started, or it is in the initial 1.5s boot delay. No AT commands are processed. **What changes:** When the boot delay expires, state becomes READY and the modem starts accepting AT commands.
 
 ```
 Set by:       sim_modem_init()
@@ -44,6 +59,8 @@ Output:       UART peripheral is live and ready
 ---
 
 ## S1: READY (Modem Booted)
+
+**High-level:** The modem has “booted” and is in AT command mode. It reads text lines from UART, parses each line as an AT command, and sends back text responses. Echo is on by default (commands are echoed before the reply). The driver can ping (AT), disable echo (ATE0), check signal (AT+CSQ), query operator (AT+COPS?), and define PDP context (AT+CGDCONT). Registration and dial commands are rejected until later states. **What changes:** The only state transition from READY is when the driver sends AT+CPIN? and we respond with +CPIN: READY → state becomes SIM_READY.
 
 ```
 Set by:       sim_modem_task after vTaskDelay(1500ms)
@@ -92,6 +109,8 @@ The modem now sits in the AT command loop. Each iteration:
 
 ## S2: SIM_READY
 
+**High-level:** The SIM is considered present and ready (we already responded to AT+CPIN? with +CPIN: READY). We still process all the same AT commands as READY, but now AT+CREG? and AT+CEREG? return “registered” (0,1) instead of “not registered” (0,0). The driver typically polls CREG/CEREG here to confirm network registration. **What changes:** When the driver sends AT+CREG? or AT+CEREG?, we respond with +CREG: 0,1 (or CEREG equivalent) and state becomes REGISTERED.
+
 ```
 Set by:       handle_at_command when AT+CPIN? received in state >= READY
 Entry action: config->state = SIM_MODEM_STATE_SIM_READY
@@ -125,6 +144,8 @@ Everything from S1 still works, plus these transitions unlock:
 
 ## S3: REGISTERED
 
+**High-level:** The modem is “registered on the cellular network” (cell tower). All previous AT commands still work. The new capability is activating the data bearer: the driver sends AT+CGACT=1,1 to bring up the PDP context so that a data call (ATD*99#) can be placed. **What changes:** When the driver sends AT+CGACT=1,1 we respond with OK and state becomes PDP_ACTIVE. ATD*99# is still rejected until we are in PDP_ACTIVE.
+
 ```
 Set by:       handle_at_command when AT+CREG? or AT+CEREG? received in state >= SIM_READY
 Entry action: config->state = SIM_MODEM_STATE_REGISTERED
@@ -154,6 +175,8 @@ All other commands behave the same as S1/S2.
 ---
 
 ## S4: PDP_ACTIVE
+
+**High-level:** The data bearer (PDP context) is active. The modem is still in AT command mode but is now allowed to “dial” for data. When the driver sends ATD*99#, we respond with CONNECT and switch to DATA_MODE. **What changes:** On ATD*99#, we set state to DATA_MODE, the main AT loop exits (the `while (state != DATA_MODE)` condition fails), and we call handle_ppp_data_mode(). From the driver’s perspective, the UART switches from text AT to binary PPP frames (0x7E-delimited).
 
 ```
 Set by:       handle_at_command when AT+CGACT=1,1 received in state >= REGISTERED
@@ -187,6 +210,8 @@ Output:       AT response strings
 
 ## S5: DATA_MODE (PPP Phase)
 
+**High-level:** We are no longer in AT mode. The modem reads raw bytes from the UART, looks for 0x7E frame boundaries and the +++ escape sequence. Complete frames are dispatched by PPP protocol ID: LCP (link negotiation), IPCP (IP address assignment), and IPv4 (ICMP ping, UDP/DNS, TCP handshake). **What changes:** LCP and IPCP establish the link and assign IPs; then IPv4 traffic is processed (echo reply, DNS reply, SYN-ACK, FIN-ACK). When the driver sends +++ with guard time, we set state back to PDP_ACTIVE, handle_ppp_data_mode() returns, and the outer task re-enters the AT command loop.
+
 ```
 Set by:       handle_at_command when ATD*99# received in state == PDP_ACTIVE
 Entry action: config->state = SIM_MODEM_STATE_DATA_MODE
@@ -202,6 +227,8 @@ decision tree on every byte:
 ---
 
 ### S5.0: Byte Read Loop
+
+**High-level:** We read one byte at a time from the UART. Each byte is either part of the +++ escape (count consecutive '+'), part of a PPP frame (accumulate until 0x7E), or filler. **What changes:** Three '+' followed by a timeout triggers escape (state → PDP_ACTIVE, return). A 0x7E with data already in the buffer completes a frame and we dispatch it (S5.2). Any other byte either resets the plus counter or is appended to the frame buffer.
 
 ```
 Input:        Single byte from uart_read_bytes (200ms timeout)
@@ -219,6 +246,8 @@ Input:        Single byte from uart_read_bytes (200ms timeout)
 
 ### S5.1: Frame Delimiter Check
 
+**High-level:** For each non-'+' byte we decide: empty 0x7E (skip), closing 0x7E (frame complete → dispatch), or payload (accumulate). **What changes:** frame_len and frame_buf are updated; when a closing 0x7E is seen we pass the buffer to S5.2 and then reset for the next frame.
+
 ```
 Input:        Current byte (not '+')
 ```
@@ -233,6 +262,8 @@ Input:        Current byte (not '+')
 ---
 
 ### S5.2: Frame Dispatch
+
+**High-level:** We have a complete PPP frame. We check the header (0xFF, 0x03) and the 16-bit protocol ID, then hand the payload to the right handler. **What changes:** LCP (0xC021) → S5.3, IPCP (0x8021) → S5.4, IPv4 (0x0021) → S5.5. Invalid header or unknown protocol is logged and the frame is discarded; control returns to the byte loop (S5.0).
 
 ```
 Input:        Complete PPP frame in frame_buf[0..frame_len-1]
@@ -250,6 +281,8 @@ Input:        Complete PPP frame in frame_buf[0..frame_len-1]
 ---
 
 ### S5.3: LCP Handler (handle_lcp_frame)
+
+**High-level:** Layer 2 link setup. We receive the driver’s LCP Config-Request, send Config-Ack (accept its options), and send our own Config-Request (MRU=1500). No state variable changes in the sim—we just send two frames. **What changes:** The link is considered configured from our side; the driver will Ack our request and then start IPCP.
 
 ```
 Networking layer: Layer 2 — Data Link
@@ -296,6 +329,8 @@ Input:            LCP frame: [4:5, code] [5:6, id] [6:8, length] [8:..., options
 ---
 
 ### S5.4: IPCP Handler (handle_ipcp_frame)
+
+**High-level:** Layer 3 address assignment. We assign the driver the IP 10.0.0.2 (via Config-Nak or Config-Ack) and tell the driver we are 10.0.0.1 with DNS 10.0.0.1 (via our Config-Request). **What changes:** Once both sides Ack, IP is “up”: the driver has 10.0.0.2, we have 10.0.0.1, and IPv4 packets can be exchanged.
 
 ```
 Networking layer: Layer 3 — Network
@@ -357,6 +392,8 @@ Driver → Modem:  Config-Ack (accepted modem's IP)
 
 ### S5.5: IPv4 Handler (handle_ipv4_packet)
 
+**High-level:** We have an IPv4 packet inside a PPP frame. We look at the protocol field and hand off to ICMP, UDP, or TCP. **What changes:** ICMP echo → we send an echo reply. UDP port 53 → we send a canned DNS response. TCP SYN → we send SYN-ACK; TCP FIN → we send FIN-ACK. Other protocols or malformed packets are dropped or logged.
+
 ```
 Networking layer: Layers 3–7
 Purpose:          Route incoming IP packets to protocol-specific handlers
@@ -376,6 +413,8 @@ Input:            IPv4 packet starting at frame_buf[4]
 ---
 
 ### S5.5a: ICMP Echo Reply
+
+**High-level:** The driver (or host) sent a ping (ICMP type 8). We swap IP src/dst, set type to 0 (Echo Reply), fix checksums, and send the packet back. **What changes:** One PPP frame out with the echo reply; no state change.
 
 ```
 Networking layer: Layer 3
@@ -400,6 +439,8 @@ Input:            ICMP header at ip[ip_hdr_len]:
 ---
 
 ### S5.5b: UDP / DNS Response
+
+**High-level:** We only handle UDP to port 53 (DNS). We parse the query (txn ID, question), echo the question back, and append an A record for 10.0.0.1. **What changes:** One PPP frame out containing IP+UDP+DNS response; no state change.
 
 ```
 Networking layer: Layer 4 (UDP) + Layer 7 (DNS)
@@ -445,6 +486,8 @@ Input:            UDP header at ip[ip_hdr_len]:
 ---
 
 ### S5.5c: TCP Handler
+
+**High-level:** We only react to SYN (connection start) and FIN (connection end). For SYN we send SYN-ACK (seq=5000, ack=their seq+1). For FIN we send FIN-ACK. We do not keep connection state or handle data segments. **What changes:** One PPP frame out per SYN or FIN; no state change in the sim.
 
 ```
 Networking layer: Layer 4
@@ -522,6 +565,8 @@ Purpose: Acknowledge connection teardown
 ---
 
 ### S5.6: Escape Detection (+++)
+
+**High-level:** The driver sends three '+' with guard time (silence before and after) to leave data mode without dropping the PDP. We count '+' in S5.0; when we have three and then a read timeout (silence), we treat that as escape. **What changes:** We set state to PDP_ACTIVE and return from handle_ppp_data_mode(); the main task loop then runs the AT command loop again (S4, then S1-style behavior on next AT).
 
 ```
 Purpose: Return from DATA_MODE to AT command mode
