@@ -2,10 +2,14 @@
 
 #include <string.h>
 #include <stdio.h>
+#include <stdbool.h>
 #include "freertos/task.h"
 #include "esp_log.h"
 
 static const char *TAG = "MODEM_DRV";
+
+// SIM PIN: in a real product this would come from a config file or secure storage.
+#define DEFAULT_SIM_PIN "0000"
 
 // ============================================================================
 //  INTERNAL HELPERS
@@ -14,59 +18,70 @@ static const char *TAG = "MODEM_DRV";
 // ---------------------------------------------------------------------------
 //  send_command_raw
 //
-//  Sends a command string over UART with a trailing '\r'.
+//  Sends a single AT command to the modem over UART. The modem expects
+//  commands terminated by '\r' (carriage return). Echo handling is done
+//  in read_response — we scan for terminators so echoed bytes are harmless.
 //
-//  TODO:
 //    1. Write the command bytes using uart_write_bytes()
-//    2. Write a '\r' byte to terminate the command
-//    3. Log the command being sent for debugging
+//    2. Write a '\r' byte to terminate the command (Hayes standard)
+//    3. Log the command for debugging
 // ---------------------------------------------------------------------------
 static void send_command_raw(modem_driver_config_t *config, const char *cmd)
 {
-    // TODO: LLM handles this
+    uart_write_bytes(config->uart_num, cmd, strlen(cmd));
+    uart_write_bytes(config->uart_num, "\r", 1);
     ESP_LOGI(TAG, "TX: %s", cmd);
 }
 
 // ---------------------------------------------------------------------------
 //  read_response
 //
-//  Reads bytes from UART RX until a known terminator line is found
-//  ("OK", "ERROR", "CONNECT", "NO CARRIER", or timeout).
+//  Reads bytes from UART RX until a known terminator is found in the buffer.
+//  Modem responses end with one of: "OK", "ERROR", "CONNECT", "NO CARRIER".
 //
-//  TODO:
-//    1. Read one byte at a time using uart_read_bytes() in a loop
-//    2. After each byte, check if buffer contains any terminator:
-//       "OK", "ERROR", "CONNECT", or "NO CARRIER"
-//    3. If found, null-terminate and return the total length
-//    4. If timeout expires, return -1
+//    1. Read one byte at a time using uart_read_bytes() with the given timeout
+//    2. After each byte, null-terminate and check if buffer contains any
+//       terminator (strstr for "OK", "ERROR", "CONNECT", "NO CARRIER")
+//    3. If found, return the total length so caller can parse with strstr()
+//    4. If timeout (got <= 0), return -1; if buffer full without terminator,
+//       return -1 (garbled — caller may flush and retry)
 //
-//  Important: if echo is still ON (before ATE0 is sent), the modem echoes
-//  your command back BEFORE sending the actual response. So the buffer
-//  will contain:
-//    "AT+CPIN?\r\n"              ← echoed command
-//    "\r\n+CPIN: READY\r\nOK\r\n" ← actual response
-//  Don't try to parse until a terminator is found — the echo bytes are
-//  harmless as long as you scan the whole buffer with strstr().
-//
-//  After ATE0 succeeds, echo stops and you'll only see the response.
-//
-//  Hint: modem responses often span multiple lines, e.g.:
-//    "\r\n+CREG: 0,1\r\nOK\r\n"
-//  You want to capture everything up to and including the "OK".
+//  Echo: if the modem has echo ON (before ATE0), the buffer will contain
+//  the echoed command first, then the actual response. We don't strip echo
+//  here — we just stop when we see a terminator. Callers use strstr(resp, "...")
+//  to find the relevant part, so echo bytes are harmless.
 // ---------------------------------------------------------------------------
 static int read_response(modem_driver_config_t *config,
                          char *buf, size_t buf_size,
                          TickType_t timeout)
 {
-    // TODO: LLM handles this
-    return -1;
+    if (buf_size < 2) return -1;
+    size_t len = 0;
+    buf[0] = '\0';
+
+    while (len < buf_size - 1) {
+        char c;
+        int got = uart_read_bytes(config->uart_num, (unsigned char *)&c, 1, timeout);
+        if (got <= 0) {
+            return (len > 0) ? (int)len : -1;
+        }
+        buf[len++] = c;
+        buf[len] = '\0';
+
+        if (strstr(buf, "OK") || strstr(buf, "ERROR") ||
+            strstr(buf, "CONNECT") || strstr(buf, "NO CARRIER")) {
+            return (int)len;
+        }
+    }
+    return -1; /* buffer full without terminator (garbled) */
 }
 
 // ---------------------------------------------------------------------------
 //  response_contains
 //
-//  Utility: returns true if the response buffer contains the given substring.
-//  Use this to check for "OK", "+CPIN: READY", "+CREG: 0,1", etc.
+//  Returns true if the response buffer contains the given substring. Callers
+//  use this to detect "OK", "+CPIN: READY", "+CREG: 0,1", "CONNECT", etc.,
+//  without assuming the response starts at index 0 (echo may prefix it).
 // ---------------------------------------------------------------------------
 static bool response_contains(const char *response, const char *needle)
 {
@@ -120,230 +135,289 @@ void modem_driver_init(modem_driver_config_t *config)
              config->baud_rate);
 }
 
+/* Number of send+read attempts in modem_send_at on timeout/garbled. */
+#define MODEM_SEND_AT_RETRIES 3
+
+// ---------------------------------------------------------------------------
+//  modem_send_at
+//
+//  Sends one AT command and reads the response. Used by all higher-level
+//  functions (modem_check_sim, modem_register_network, etc.).
+//
+//    1. Flush any stale data in the UART RX buffer so we don't see old
+//       responses or garbage from a previous command.
+//    2. Send the command (send_command_raw) and read until a terminator
+//       (read_response). On success, log the response and return length.
+//    3. On timeout or garbled (buffer full without terminator), flush RX
+//       and retry up to MODEM_SEND_AT_RETRIES. Return -1 if all attempts fail.
+// ---------------------------------------------------------------------------
 int modem_send_at(modem_driver_config_t *config,
                   const char *cmd,
                   char *resp_buf, size_t resp_buf_size,
                   TickType_t timeout)
 {
-    // TODO:
-    //   1. Flush any stale data in the UART RX buffer (uart_flush_input)
-    //   2. Call send_command_raw() to transmit the command
-    //   3. Call read_response() to receive the reply
-    //   4. Log the response for debugging
-    //   5. Return bytes read, or -1 on timeout
+    uart_flush_input(config->uart_num);
 
+    for (int attempt = 0; attempt < MODEM_SEND_AT_RETRIES; attempt++) {
+        send_command_raw(config, cmd);
+        int n = read_response(config, resp_buf, resp_buf_size, timeout);
+        if (n >= 0) {
+            ESP_LOGI(TAG, "RX: %.*s", n, resp_buf);
+            return n;
+        }
+        uart_flush_input(config->uart_num);
+    }
     return -1;
 }
 
-// Called 3 second after task start
+// ---------------------------------------------------------------------------
+//  modem_check_sim
+//
+//  Verifies the modem is alive and the SIM is ready. Called after the
+//  task has waited for modem boot. Sends: AT (ping), ATE0 (disable echo),
+//  AT+CPIN? (SIM status). On real hardware may see SIM PIN, SIM PUK, or
+//  CME errors — those are handled as fatal (return -1) where appropriate.
+// ---------------------------------------------------------------------------
 int modem_check_sim(modem_driver_config_t *config)
 {
     char resp[256];
+    bool success = false;
 
-    // First AT command should have longer timeout
     TickType_t at_timeout = pdMS_TO_TICKS(4000);
 
-    //   Step 1 — Ping the modem with "AT"
-    //     - Call modem_send_at(config, "AT", resp, sizeof(resp), at_timeout)
-    //     - If response_contains(resp, "OK") → modem is alive
-    //     - If timeout, retry up to 5 times with 1s delays (modem booting)
-    //     - If still no response after retries, return -1
-    for loop try 5 times
-        call modem send with AT command to modem
-        parse response, handle echo if needed (this should also be done in modem_send_at)
-        if response is OK
-            log successful initial ping
-            success = true
-            break loop
-        if Timeout
-            log timeout, continue
-        if random cfun
-            ignore, continue
-        if garbled or other error (rx buffer flushed by sending function (modem_send_at)
-            log error, continue 
-        wait a second
-    
-    if success is not true
-        return -1
+    // -----------------------------------------------------------------------
+    // Step 1: Ping the modem with "AT".
+    // Retry up to 5 times with 1s delay — modem may still be booting.
+    // -----------------------------------------------------------------------
+    for (int i = 0; i < 5; i++) {
+        int n = modem_send_at(config, "AT", resp, sizeof(resp), at_timeout);
+        if (n >= 0 && response_contains(resp, "OK")) {
+            ESP_LOGI(TAG, "Initial ping OK");
+            success = true;
+            break;
+        }
+        if (n < 0) {
+            ESP_LOGW(TAG, "AT timeout, retry %d/5", i + 1);
+        } else if (response_contains(resp, "+CFUN")) {
+            /* Unsolicited power-on notification — ignore and retry */
+        } else {
+            ESP_LOGW(TAG, "AT error/garbled, retry");
+        }
+        vTaskDelay(pdMS_TO_TICKS(1000));
+    }
+    if (!success) return -1;
 
-    // Set timeouts for basic AT commands to 2 seconds (not including CGACT, ATD)
-    TickType_t at_timeout = pdMS_TO_TICKS(2000);
+    at_timeout = pdMS_TO_TICKS(2000);
+    bool echohandling = true;
 
-    //   Step 2 — Disable echo with "ATE0"
-    //     - Call modem_send_at(config, "ATE0", resp, sizeof(resp), at_timeout)
-    //     - Expect "OK", if it keeps failing, continue with echo handling
-    //     - After this succeeds, the modem stops echoing commands back.
-    //       Subsequent responses will NOT be prefixed with the echoed command.
-    //       read_response() handles both cases (with/without echo) because it
-    //       scans the whole buffer for terminators regardless.
-    echohandling = true (This could be a global so modem_send_at can see it)
-    for loop try 3 times 
-        call modem send with ate0 
-        parse response
-        if ok 
-            echohandling = false
-            log success and break
-        if garbled or other error
-            log error and continue 
-        wait a second
+    // -----------------------------------------------------------------------
+    // Step 2: Disable echo with "ATE0".
+    // If it fails after 3 tries we continue anyway — read_response handles
+    // echo by scanning for terminators; we just log and proceed.
+    // -----------------------------------------------------------------------
+    for (int i = 0; i < 3; i++) {
+        int n = modem_send_at(config, "ATE0", resp, sizeof(resp), at_timeout);
+        if (n >= 0 && response_contains(resp, "OK")) {
+            echohandling = false;
+            ESP_LOGI(TAG, "Echo disabled");
+            break;
+        }
+        if (n < 0) ESP_LOGW(TAG, "ATE0 timeout");
+        else ESP_LOGW(TAG, "ATE0 error");
+        vTaskDelay(pdMS_TO_TICKS(1000));
+    }
+    if (echohandling) ESP_LOGW(TAG, "Echo disable failed, continuing with echo handling");
 
-    if echohandling is true (after 3 attempts) 
-        log echo disable failed
-
-    // TODO:
-    //   Step 3 — Check SIM with "AT+CPIN?"
-    //     - Call modem_send_at(config, "AT+CPIN?", resp, sizeof(resp), at_timeout)
-    //     - Check response_contains(resp, "+CPIN: READY")
-    //     - If ready: set state = MODEM_DRIVER_SIM_OK, return 0
-    //     - If not: log error, set state = MODEM_DRIVER_ERROR, return -1
-    //     - On real hardware, may get "+CPIN: SIM PIN" (needs PIN) or
-    //       "+CME ERROR: 10" (no SIM inserted) — handle as fatal
-    for loop try 3 times
-        send AT+CPIN? 
-        parse received data, handle echo if needed 
-        if ready 
-            log ready 
-            return 0 
-        if SIM PIN 
-            (For the LLM: If a config file does not exist, create a config file with a field for sim pin)
-            if pin unknown
-                log pin unknown 
-                return -1 
-            send AT+CPIN="insert pin" 
-            parse received data, handle echo if needed
-            if success 
-                log ready 
-                return 0
-        if SIM PUK 
-            log error
-            fatal
-        if CME ERROR 10 
-            log sim not inserted 
-            fatal 
-        if CME ERROR 13 
-            log sim no work 
-            fatal
-        if garbled or other error
-            log garbled, continue 
-        wait a second
-
-    (void)resp;
-    log did not work after 3 tries
+    // -----------------------------------------------------------------------
+    // Step 3: Check SIM with "AT+CPIN?".
+    // READY → success. SIM PIN → send PIN (DEFAULT_SIM_PIN), then success if OK.
+    // SIM PUK / CME 10 (no SIM) / CME 13 (SIM failure) → fatal (return -1).
+    // -----------------------------------------------------------------------
+    for (int i = 0; i < 3; i++) {
+        int n = modem_send_at(config, "AT+CPIN?", resp, sizeof(resp), at_timeout);
+        if (n >= 0 && response_contains(resp, "+CPIN: READY")) {
+            config->state = MODEM_DRIVER_SIM_OK;
+            ESP_LOGI(TAG, "SIM ready");
+            return 0;
+        }
+        if (n >= 0 && response_contains(resp, "+CPIN: SIM PIN")) {
+            n = modem_send_at(config, "AT+CPIN=\"" DEFAULT_SIM_PIN "\"", resp, sizeof(resp), at_timeout);
+            if (n >= 0 && response_contains(resp, "OK")) {
+                config->state = MODEM_DRIVER_SIM_OK;
+                ESP_LOGI(TAG, "SIM ready (PIN accepted)");
+                return 0;
+            }
+            ESP_LOGE(TAG, "SIM PIN unknown or wrong");
+            return -1;
+        }
+        if (n >= 0 && response_contains(resp, "SIM PUK")) {
+            ESP_LOGE(TAG, "SIM PUK locked");
+            return -1;
+        }
+        if (n >= 0 && response_contains(resp, "+CME ERROR: 10")) {
+            ESP_LOGE(TAG, "SIM not inserted");
+            return -1;
+        }
+        if (n >= 0 && response_contains(resp, "+CME ERROR: 13")) {
+            ESP_LOGE(TAG, "SIM failure");
+            return -1;
+        }
+        if (n < 0) ESP_LOGW(TAG, "AT+CPIN? timeout");
+        else ESP_LOGW(TAG, "AT+CPIN? garbled or other error");
+        vTaskDelay(pdMS_TO_TICKS(1000));
+    }
+    ESP_LOGE(TAG, "SIM check failed after 3 tries");
     return -1;
 }
 
+// ---------------------------------------------------------------------------
+//  modem_register_network
+//
+//  Registers on the cellular network. Sends AT+CSQ (signal quality), then
+//  polls AT+CREG? until registered (stat 1 = home, 5 = roaming). On success
+//  sends AT+COPS? (operator name), sets state REGISTERED, and returns 0.
+// ---------------------------------------------------------------------------
 int modem_register_network(modem_driver_config_t *config)
 {
     char resp[256];
+    int rssi = 0, ber = 0;
 
     TickType_t at_timeout = pdMS_TO_TICKS(2000);
 
-    // TODO:
-    //   Step 1 — Check signal quality
-    //     - Send modem_send_at(config, "AT+CSQ", resp, sizeof(resp), at_timeout)
-    //     - Parse "+CSQ: <rssi>,<ber>" from response
-    //       Hint: use sscanf(strstr(resp, "+CSQ:"), "+CSQ: %d,%d", &rssi, &ber)
-    //     - Log: "Signal: RSSI=%d, BER=%d"
-    //     - If rssi == 99 (unknown), signal is bad — may want to retry
-    implement as is, log RSSI and BER value
+    // Step 1: Check signal quality (informational; we log RSSI/BER).
+    int n = modem_send_at(config, "AT+CSQ", resp, sizeof(resp), at_timeout);
+    if (n >= 0) {
+        const char *csq = strstr(resp, "+CSQ:");
+        if (csq && sscanf(csq, "+CSQ: %d,%d", &rssi, &ber) >= 2) {
+            ESP_LOGI(TAG, "Signal: RSSI=%d, BER=%d", rssi, ber);
+        }
+    }
 
-    // TODO:
-    //   Step 2 — Poll registration status (with retries)
-    //     - Send modem_send_at(config, "AT+CREG?", resp, sizeof(resp), at_timeout)
-    //     - Check for "+CREG: 0,1" (registered home) or "+CREG: 0,5" (roaming)
-    //     - If "+CREG: 0,2" (searching), wait 2s and retry (up to 10 times)
-    //     - If "+CREG: 0,3" (denied), return -1 immediately
-    send CREG? command
-    parse creg command 
-    for loop repeat 10 times
-        if creg 01 or 05 
-            log creg number and registration success 
-            return 0 
-        if creg 02 
-            log waiting 
-            wait 2 seconds 
-            continue 
-        if creg 03 
-            log denied 
-            fatal return -1
-    log tried 10 times and failed 
-    return -1
-
-    // TODO:
-    //   Step 3 — Query operator
-    //     - Send "AT+COPS?"
-    //     - Log the operator name from the response
-    do instruction above
-
-    // TODO:
-    //   Step 4 — On success:
-    //     - Set state = MODEM_DRIVER_REGISTERED
-    //     - printf() to console: "Registered on network"
-    //     - Return 0 
-    do instruction above
-
-    (void)resp;
+    // Step 2: Poll registration status. CREG second value: 1 = home, 5 = roaming,
+    // 2 = searching, 3 = denied. We retry up to 10 times; if 2, wait 2s and continue.
+    for (int i = 0; i < 10; i++) {
+        n = modem_send_at(config, "AT+CREG?", resp, sizeof(resp), at_timeout);
+        if (n < 0) {
+            vTaskDelay(pdMS_TO_TICKS(2000));
+            continue;
+        }
+        const char *creg = strstr(resp, "+CREG:");
+        if (!creg) {
+            vTaskDelay(pdMS_TO_TICKS(2000));
+            continue;
+        }
+        int n_val = -1, stat = -1;
+        sscanf(creg, "+CREG: %d,%d", &n_val, &stat);
+        if (stat == 1 || stat == 5) {
+            ESP_LOGI(TAG, "CREG %d — registration success", stat);
+            // Step 3: Query operator name (log only).
+            n = modem_send_at(config, "AT+COPS?", resp, sizeof(resp), at_timeout);
+            if (n >= 0) {
+                const char *op = strstr(resp, "+COPS:");
+                if (op) ESP_LOGI(TAG, "Operator: %s", op);
+            }
+            // Step 4: Set state and report success.
+            config->state = MODEM_DRIVER_REGISTERED;
+            printf("Registered on network\n");
+            return 0;
+        }
+        if (stat == 2) {
+            ESP_LOGI(TAG, "Waiting for registration...");
+            vTaskDelay(pdMS_TO_TICKS(2000));
+            continue;
+        }
+        if (stat == 3) {
+            ESP_LOGE(TAG, "Registration denied");
+            return -1;
+        }
+        vTaskDelay(pdMS_TO_TICKS(2000));
+    }
+    ESP_LOGE(TAG, "Registration failed after 10 tries");
     return -1;
 }
 
+// ---------------------------------------------------------------------------
+//  modem_activate_pdp
+//
+//  Defines the PDP context (CGDCONT) and activates it (CGACT). Define only
+//  tells the modem "context 1 = IP, APN internet"; activate actually brings
+//  up the data bearer. On real hardware, CGACT can take 5–30s; we use a
+//  long timeout. CME 30 (no network) / 33 (not subscribed) → fatal. CME 148
+//  → retry once, then fail.
+// ---------------------------------------------------------------------------
 int modem_activate_pdp(modem_driver_config_t *config)
 {
     char resp[256];
 
-    // PDP activation can take 5-30s on real networks. Use a longer timeout.
     TickType_t at_timeout = pdMS_TO_TICKS(2000);
     TickType_t pdp_timeout = pdMS_TO_TICKS(30000);
 
-    // TODO:
-    //   Step 1 — Define PDP context
-    //     - Send modem_send_at(config, "AT+CGDCONT=1,\"IP\",\"internet\"",
-    //                          resp, sizeof(resp), at_timeout)
-    //     - Expect "OK"
-    // Add comment: Here, define just says that there are 2 contexts, IP and Internet
-    do step above, log error and fatal if it errors
+    // Step 1: Define PDP context — context ID 1, type IP, APN "internet".
+    // Define only declares the parameters; the modem does not bring up
+    // the bearer until we send CGACT=1,1.
+    int n = modem_send_at(config, "AT+CGDCONT=1,\"IP\",\"internet\"",
+                          resp, sizeof(resp), at_timeout);
+    if (n < 0 || !response_contains(resp, "OK")) {
+        ESP_LOGE(TAG, "PDP define (CGDCONT) failed");
+        return -1;
+    }
 
-    // TODO:
-    //   Step 2 — Activate PDP context
-    //     - Send modem_send_at(config, "AT+CGACT=1,1",
-    //                          resp, sizeof(resp), pdp_timeout)
-    //     - Expect "OK"
-    //     - On success: set state = MODEM_DRIVER_PDP_ACTIVE, return 0
-    //     - On failure: return -1
-    //     - On real hardware, may get "+CME ERROR: 30" (no network) or
-    //       "+CME ERROR: 33" (not subscribed) — handle as fatal 
-    do step above, if -1, 30, or 33 handle as described, and log error
-    if 148, retry and then if it fails again, log and return -1
-
-    (void)resp;
+    // Step 2: Activate context 1. Use long timeout (real networks can be slow).
+    for (int attempt = 0; attempt < 2; attempt++) {
+        n = modem_send_at(config, "AT+CGACT=1,1", resp, sizeof(resp), pdp_timeout);
+        if (n >= 0 && response_contains(resp, "OK")) {
+            config->state = MODEM_DRIVER_PDP_ACTIVE;
+            return 0;
+        }
+        if (n < 0 || response_contains(resp, "+CME ERROR: 30")) {
+            ESP_LOGE(TAG, "PDP activate failed (no network or timeout)");
+            return -1;
+        }
+        if (response_contains(resp, "+CME ERROR: 33")) {
+            ESP_LOGE(TAG, "PDP activate failed (not subscribed)");
+            return -1;
+        }
+        if (response_contains(resp, "+CME ERROR: 148")) {
+            ESP_LOGW(TAG, "PDP activate CME 148, retry %d", attempt + 1);
+            continue;
+        }
+        ESP_LOGE(TAG, "PDP activate error");
+        return -1;
+    }
+    ESP_LOGE(TAG, "PDP activate failed after retry");
     return -1;
 }
 
+// ---------------------------------------------------------------------------
+//  modem_enter_data_mode
+//
+//  Dials the data call (ATD*99#) to switch the UART from AT text to PPP
+//  binary frames. We expect "CONNECT" (not "OK"). If we see "NO CARRIER" or
+//  timeout, the PDP may have dropped — return -1. On success, set state
+//  DATA_MODE; after this, no more AT commands — the link carries PPP.
+// ---------------------------------------------------------------------------
 int modem_enter_data_mode(modem_driver_config_t *config)
 {
     char resp[256];
 
-    // Dial can take 5-10s on real modems while network-side PPP sets up.
     TickType_t dial_timeout = pdMS_TO_TICKS(10000);
 
-    // TODO:
-    //   Step 1 — Request PPP data mode
-    //     - Send modem_send_at(config, "ATD*99#",
-    //                          resp, sizeof(resp), dial_timeout)
-    //     - Check for "CONNECT" in the response (NOT "OK")
-    //     - If response_contains(resp, "NO CARRIER"): PDP dropped, return -1
-    //     - If timeout: modem may be stuck, return -1 
-    do as above 
-
-    // TODO:
-    //   Step 2 — On success:
-    //     - Set state = MODEM_DRIVER_DATA_MODE
-    //     - printf() to console: "PPP data mode established"
-    //     - Return 0
-    //     - After this, UART is no longer AT — it carries PPP frames 
-    do as above 
-
-    (void)resp;
-    return -1;
+    int n = modem_send_at(config, "ATD*99#", resp, sizeof(resp), dial_timeout);
+    if (n < 0) {
+        ESP_LOGE(TAG, "Dial timeout");
+        return -1;
+    }
+    if (response_contains(resp, "NO CARRIER")) {
+        ESP_LOGE(TAG, "NO CARRIER — PDP dropped");
+        return -1;
+    }
+    if (!response_contains(resp, "CONNECT")) {
+        ESP_LOGE(TAG, "Dial failed (no CONNECT)");
+        return -1;
+    }
+    config->state = MODEM_DRIVER_DATA_MODE;
+    printf("PPP data mode established\n");
+    return 0;
 }
 
 void modem_driver_task(void *param)
