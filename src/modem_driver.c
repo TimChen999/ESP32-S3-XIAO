@@ -11,6 +11,11 @@ static const char *TAG = "MODEM_DRV";
 // SIM PIN: in a real product this would come from a config file or secure storage.
 #define DEFAULT_SIM_PIN "0000"
 
+// Echo state: set to true when ATE0 succeeds so read_response can skip stripping.
+// When false, the modem may still be echoing commands; read_response strips the
+// first line (echoed command + \r\n) so the buffer starts with the modem reply.
+static bool g_echo_disabled = false;
+
 // ============================================================================
 //  INTERNAL HELPERS
 // ============================================================================
@@ -46,10 +51,10 @@ static void send_command_raw(modem_driver_config_t *config, const char *cmd)
 //    4. If timeout (got <= 0), return -1; if buffer full without terminator,
 //       return -1 (garbled — caller may flush and retry)
 //
-//  Echo: if the modem has echo ON (before ATE0), the buffer will contain
-//  the echoed command first, then the actual response. We don't strip echo
-//  here — we just stop when we see a terminator. Callers use strstr(resp, "...")
-//  to find the relevant part, so echo bytes are harmless.
+//  Echo: g_echo_disabled is set when ATE0 succeeds. When it is false, the buffer
+//  may start with the echoed command plus \r\n; we strip that first line so
+//  the returned buffer starts with the modem's response. When g_echo_disabled
+//  is true we return the buffer as-is.
 // ---------------------------------------------------------------------------
 static int read_response(modem_driver_config_t *config,
                          char *buf, size_t buf_size,
@@ -70,6 +75,16 @@ static int read_response(modem_driver_config_t *config,
 
         if (strstr(buf, "OK") || strstr(buf, "ERROR") ||
             strstr(buf, "CONNECT") || strstr(buf, "NO CARRIER")) {
+            if (!g_echo_disabled) {
+                char *first_crlf = strstr(buf, "\r\n");
+                if (first_crlf != NULL && (size_t)(first_crlf - buf) < len) {
+                    size_t skip = (size_t)(first_crlf - buf) + 2;
+                    if (skip < len) {
+                        memmove(buf, buf + skip, len - skip + 1);
+                        return (int)(len - skip);
+                    }
+                }
+            }
             return (int)len;
         }
     }
@@ -219,6 +234,7 @@ int modem_check_sim(modem_driver_config_t *config)
         int n = modem_send_at(config, "ATE0", resp, sizeof(resp), at_timeout);
         if (n >= 0 && response_contains(resp, "OK")) {
             echohandling = false;
+            g_echo_disabled = true;  /* read_response will no longer strip first line */
             ESP_LOGI(TAG, "Echo disabled");
             break;
         }
