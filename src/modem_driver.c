@@ -11,6 +11,9 @@ static const char *TAG = "MODEM_DRV";
 // SIM PIN: in a real product this would come from a config file or secure storage.
 #define DEFAULT_SIM_PIN "0000"
 
+// MAX FAILURES: the max number of time modem handshake can fail before fatal
+#define MAX_FAILS_GETIP 10
+
 // Echo state: set to true when ATE0 succeeds so read_response can skip stripping.
 // When false, the modem may still be echoing commands; read_response strips the
 // first line (echoed command + \r\n) so the buffer starts with the modem reply.
@@ -436,6 +439,9 @@ int modem_enter_data_mode(modem_driver_config_t *config)
     return 0;
 }
 
+// Record failures (LLM should format this)
+int getIP_fails = 0;
+
 void modem_driver_task(void *param)
 {
     modem_driver_config_t *config = (modem_driver_config_t *)param;
@@ -458,6 +464,7 @@ void modem_driver_task(void *param)
     // On failure, skip remaining steps and report which step failed.
     // -----------------------------------------------------------------------
 
+label: full_recovery 
     // Step 2a: Verify modem is alive and SIM is ready.
     // Sends: AT, ATE0, AT+CPIN? — expects OK and +CPIN: READY.
     if (modem_check_sim(config) != 0) {
@@ -482,6 +489,7 @@ void modem_driver_task(void *param)
     }
     printf("Driver: PDP context active\n");
 
+label: redial 
     // Step 2d: Switch UART from AT text to PPP binary.
     // Sends: ATD*99# — expects CONNECT. After this, no more AT commands.
     if (modem_enter_data_mode(config) != 0) {
@@ -491,18 +499,120 @@ void modem_driver_task(void *param)
     printf("Driver: PPP link up\n");
 
     // -----------------------------------------------------------------------
-    // Step 3: Hand off to PPP (Phase 2 — implement later).
-    // After modem_enter_data_mode() returns 0, the UART now carries
-    // binary PPP frames. No more AT commands can be sent.
-    // To bring up IP connectivity, use ESP-IDF's PPP netif:
-    //   1. Create esp_netif with ESP_NETIF_DEFAULT_PPP()
-    //   2. Create an esp_modem DTE on this UART
-    //   3. Call esp_modem_set_mode(dce, ESP_MODEM_MODE_PPP)
-    //   4. lwIP handles LCP/IPCP negotiation automatically
-    //   5. Wait for IP_EVENT_PPP_GOT_IP
-    //   6. Standard socket APIs work (connect, send, recv)
-    // Alternatively, send raw PPP frames to the sim_modem directly.
-    // See ESP-IDF examples: examples/protocols/pppos_client
+    // Step 3: PPP Phase 2 — hand UART to lwIP and bring up IP.
+    // After modem_enter_data_mode() the UART carries binary PPP frames only.
+    // No more AT; the driver must stop reading/writing this UART and let
+    // the PPP stack own it. Detailed TODO sequence:
+    
+    // TODO Phase 2.1 — Create PPP network interface
+    //   - esp_netif_config_t cfg = ESP_NETIF_DEFAULT_PPP();
+    //   - esp_netif_t *netif = esp_netif_new(&cfg);
+    //   - Can go wrong: esp_netif_new fails (e.g. no heap). Check for NULL;
+    //     log and goto error if so.
+    Do as todo says
+
+    // TODO Phase 2.2 — Create PPPoS (PPP over serial) and bind to our UART
+    //   - Use the same config->uart_num that modem_driver_init installed.
+    //   - Typical: ppp_netif_pppos_create(netif, ppp_status_cb, ...) or
+    //     esp_netif_ppp_set_params() and a DTE that reads/writes config->uart_num.
+    //   - Can go wrong: UART already in use by this task — ensure no other
+    //     code (e.g. read_response) is called on this UART after data mode.
+    //     Can go wrong: Wrong uart_num or driver not installed; PPP will read
+    //     garbage or hang. Pass config->uart_num into the PPP init.
+    Do as todo says
+    log create PPPoS, bind to this UART, nothing else can use this UART
+
+    // TODO Phase 2.3 — Register netif and set as default (optional)
+    //   - esp_netif_attach(netif, ...) if using esp_modem; or register netif
+    //     so lwIP routes through it.
+    //   - Can go wrong: Netif not default — apps may try to use WiFi. Set
+    //     default route via this netif after IP is up.
+    register netif from 2.1
+    set the default netif to the PPP netif from 2.1 //Should fix that what can go wrong
+    log this
+
+    // TODO Phase 2.4 — lwIP LCP/IPCP negotiation
+    //   - lwIP sends LCP Config-Request, then IPCP; the modem (or sim_modem)
+    //     replies. No extra code here — the PPP state machine runs on RX bytes.
+    //   - Can go wrong: LCP timeout — modem not sending Config-Ack; check
+    //     wiring and that sim_modem (or real modem) is in DATA_MODE. Can go
+    //     wrong: IPCP never completes — modem may not assign IP; check modem
+    //     logs. Can go wrong: MRU or option mismatch — sim accepts 1500; real
+    //     modems may Nak; lwIP should retry with adjusted options.
+    // This is abstracted away by the internal stack
+    // - lwIP (PPP state machine) does LCP and IPCP.
+    // - ESP-IDF (PPPoS / netif glue) connects that to the UART and to the esp_netif.
+
+    // TODO Phase 2.5 — Wait for IP address (PPP got IP)
+    //   - Register for IP_EVENT_PPP_GOT_IP (or equivalent) or block until
+    //     esp_netif_get_ip_info(netif, &info) shows a valid address (not 0.0.0.0).
+    //   - Use a timeout (e.g. 30s); if no IP by then, log "PPP IP timeout" and
+    //     goto error.
+    //   - Can go wrong: Timeout — LCP/IPCP failed or modem didn’t assign IP.
+    //     Can go wrong: Event not fired — ensure netif and PPP are registered
+    //     with the event loop.
+    // This uses branch statements instead of a loop to retry because some error types require starting further up the process
+    Register for IP_EVENT_PPP_GOT_IP (or equivalent) or block until (with timeout)
+    if success 
+        log success 
+        break loop 
+    if LCP timeout, LCP config reject, LCP config nak, IPCP timeout, IPCP config reject, IPCP config nak, Malformed or unexpected LCP/IPCP (no IP in 2.5), Transient PPP framing / FCS errors
+        getIP_fails++
+        log failure 
+        if getIP_fails > MAX_FAILS_GETIP
+            return fatal
+        goto redial 
+    if LCP Terminate, LCP Echo not answered, link dropped, Modem assigns 0.0.0.0, Modem drops to AT mode during negotiation, NO CARRIER or link-down during 2.4
+        getIP_fails++
+        log failure 
+        if getIP_fails > MAX_FAILS_GETIP
+            return fatal
+        goto full_recovery
+    if other error/failure 
+        log the failure 
+        return fatal 
+    if no IP after 30 seconds 
+        log PPP IP timeout 
+        if getIP_fails > MAX_FAILS_GETIP
+            return fatal
+        if getIP_fails > MAX_FAILS_GETIP/2
+            goto full_recovery
+        else 
+            goto redial 
+
+    insert list of 5 common NTPs 
+    for loop try up to 5 times
+        run time sync sequence 
+        if success 
+            log success 
+            break
+        if timeout, socket/network error, SNTP sync never completes
+            log failure 
+            wait 10 seconds 
+            try again
+        if DNS failure for NTP hostmane, invalid/bogus time
+            log failure
+            go to next NTP on list, based on for loop index 
+        if NTP/SNTP init failure, No NTP servers configured or invalid config 
+            log failure 
+            return fatal
+
+    if no success after loop 
+        return fatal 
+    else (success)
+        continue 
+    
+
+    // TODO Phase 2.6 — Use the link (sockets, DNS, TLS)
+    //   - Standard socket APIs (connect, send, recv) now use this interface
+    //     if it is the default. getaddrinfo() uses DNS (modem often provides
+    //     DNS via IPCP; sim_modem stub returns 10.0.0.1).
+    //   - Can go wrong: DNS fails — no route or wrong DNS server. Can go
+    //     wrong: TLS fails — often system time wrong; sync time (NTP) before
+    //     first HTTPS. Can go wrong: No carrier — modem drops PPP; handle
+    //     link-down and optionally re-run AT sequence.
+    //
+    // Reference: ESP-IDF examples/protocols/pppos_client
     // -----------------------------------------------------------------------
 
     printf("=== All AT layers connected — PPP Phase 2 not yet implemented ===\n");
