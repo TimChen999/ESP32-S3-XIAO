@@ -3,8 +3,14 @@
 #include <string.h>
 #include <stdio.h>
 #include <stdbool.h>
+#include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/event_groups.h"
 #include "esp_log.h"
+#include "esp_netif.h"
+#include "esp_netif_ppp.h"
+#include "esp_event.h"
+#include "driver/uart.h"
 
 static const char *TAG = "MODEM_DRV";
 
@@ -408,6 +414,21 @@ int modem_activate_pdp(modem_driver_config_t *config)
 }
 
 // ---------------------------------------------------------------------------
+//  modem_exit_data_mode
+//
+//  Sends +++ with guard time to return modem from PPP data mode to AT mode.
+//  Required before retrying (goto redial/full_recovery) — otherwise modem
+//  stays in DATA_MODE and won't process ATD*99# or AT commands.
+//  Sim_modem detects 3 consecutive '+' then timeout → state PDP_ACTIVE.
+// ---------------------------------------------------------------------------
+static void modem_exit_data_mode(modem_driver_config_t *config)
+{
+    vTaskDelay(pdMS_TO_TICKS(1000));  // Guard time before +++
+    uart_write_bytes(config->uart_num, "+++", 3);
+    vTaskDelay(pdMS_TO_TICKS(500));   // Allow sim to detect timeout after +++
+}
+
+// ---------------------------------------------------------------------------
 //  modem_enter_data_mode
 //
 //  Dials the data call (ATD*99#) to switch the UART from AT text to PPP
@@ -439,8 +460,115 @@ int modem_enter_data_mode(modem_driver_config_t *config)
     return 0;
 }
 
-// Record failures (LLM should format this)
-int getIP_fails = 0;
+// ---------------------------------------------------------------------------
+//  getIP_fails
+//
+//  Tracks consecutive PPP IP acquisition failures. Used by Phase 2.5 branch
+//  logic: transient errors (LCP/IPCP timeout, config reject/nak) → goto redial;
+//  link-down errors (LCP Terminate, 0.0.0.0, NO CARRIER) → goto full_recovery.
+//  When getIP_fails > MAX_FAILS_GETIP we return fatal. When > MAX_FAILS_GETIP/2
+//  we prefer full_recovery over redial for timeout case (pseudocode 2.5).
+// ---------------------------------------------------------------------------
+static int getIP_fails = 0;
+
+// PPP Phase 2 context: netif, config (for UART), and RX task control.
+#define PPP_RX_BUF_SIZE 1024
+#define PPP_IP_TIMEOUT_MS 30000
+
+typedef struct {
+    modem_driver_config_t *config;
+    esp_netif_t *netif;
+    volatile bool ppp_rx_stop;
+} ppp_phase_ctx_t;
+
+// Transmit callback: PPP stack calls this to send bytes to the modem.
+// handle is our config pointer (set in driver_cfg).
+static esp_err_t ppp_transmit(void *handle, void *buffer, size_t len)
+{
+    modem_driver_config_t *cfg = (modem_driver_config_t *)handle;
+    uart_write_bytes(cfg->uart_num, buffer, len);
+    return ESP_OK;
+}
+
+// PPP RX task: reads from UART, feeds esp_netif_receive. Runs until ppp_rx_stop.
+static void ppp_rx_task(void *arg)
+{
+    ppp_phase_ctx_t *ctx = (ppp_phase_ctx_t *)arg;
+    char *buf = malloc(PPP_RX_BUF_SIZE);
+    if (!buf) {
+        ESP_LOGE(TAG, "PPP RX task: malloc failed");
+        vTaskDelete(NULL);
+        return;
+    }
+    while (!ctx->ppp_rx_stop) {
+        int n = uart_read_bytes(ctx->config->uart_num, buf, PPP_RX_BUF_SIZE,
+                                pdMS_TO_TICKS(100));
+        if (n > 0) {
+            esp_netif_receive(ctx->netif, buf, (size_t)n, NULL);
+        }
+    }
+    free(buf);
+    vTaskDelete(NULL);
+}
+
+// Event group for Phase 2.5: wait for IP or error. Shared with handlers.
+static EventGroupHandle_t s_ppp_evt = NULL;
+static const int PPP_GOT_IP_BIT = BIT0;
+static const int PPP_FAIL_REDIAL_BIT = BIT1;   // goto redial
+static const int PPP_FAIL_FULL_BIT = BIT2;     // goto full_recovery
+static const int PPP_FAIL_FATAL_BIT = BIT3;    // return fatal
+
+static void on_ppp_ip_event(void *arg, esp_event_base_t base, int32_t id, void *data)
+{
+    if (id == IP_EVENT_PPP_GOT_IP) {
+        ip_event_got_ip_t *ev = (ip_event_got_ip_t *)data;
+        ESP_LOGI(TAG, "PPP got IP: " IPSTR, IP2STR(&ev->ip_info.ip));
+        xEventGroupSetBits(s_ppp_evt, PPP_GOT_IP_BIT);
+    } else if (id == IP_EVENT_PPP_LOST_IP) {
+        ESP_LOGI(TAG, "PPP lost IP — link down");
+        xEventGroupSetBits(s_ppp_evt, PPP_FAIL_FULL_BIT);
+    }
+}
+
+static void on_ppp_status_event(void *arg, esp_event_base_t base, int32_t id, void *data)
+{
+    // Map NETIF_PPP_STATUS to redial vs full_recovery vs fatal (pseudocode 2.5).
+    // redial: LCP timeout, config reject/nak, IPCP timeout, protocol/option mismatch
+    // full_recovery: LCP Terminate, link dropped, 0.0.0.0, NO CARRIER
+    if (id >= NETIF_PPP_INTERNAL_ERR_OFFSET) {
+        ESP_LOGE(TAG, "PPP internal error %ld", (long)id);
+        xEventGroupSetBits(s_ppp_evt, PPP_FAIL_FATAL_BIT);
+        return;
+    }
+    if (id >= NETIF_PP_PHASE_OFFSET) {
+        if (id == NETIF_PPP_PHASE_TERMINATE || id == NETIF_PPP_PHASE_DEAD ||
+            id == NETIF_PPP_PHASE_DISCONNECT) {
+            ESP_LOGW(TAG, "PPP phase %ld — link down, full recovery", (long)id);
+            xEventGroupSetBits(s_ppp_evt, PPP_FAIL_FULL_BIT);
+        }
+        return;
+    }
+    switch ((int)id) {
+        case NETIF_PPP_ERRORPROTOCOL:
+        case NETIF_PPP_ERRORPARAM:
+        case NETIF_PPP_ERRORPEERDEAD:
+        case NETIF_PPP_ERRORIDLETIMEOUT:
+        case NETIF_PPP_ERRORCONNECTTIME:
+            ESP_LOGW(TAG, "PPP error %ld — transient, redial", (long)id);
+            xEventGroupSetBits(s_ppp_evt, PPP_FAIL_REDIAL_BIT);
+            break;
+        case NETIF_PPP_ERRORCONNECT:
+        case NETIF_PPP_ERROROPEN:
+        case NETIF_PPP_ERRORDEVICE:
+            ESP_LOGW(TAG, "PPP error %ld — link/device, full recovery", (long)id);
+            xEventGroupSetBits(s_ppp_evt, PPP_FAIL_FULL_BIT);
+            break;
+        default:
+            ESP_LOGE(TAG, "PPP error %ld — fatal", (long)id);
+            xEventGroupSetBits(s_ppp_evt, PPP_FAIL_FATAL_BIT);
+            break;
+    }
+}
 
 void modem_driver_task(void *param)
 {
@@ -464,7 +592,7 @@ void modem_driver_task(void *param)
     // On failure, skip remaining steps and report which step failed.
     // -----------------------------------------------------------------------
 
-label: full_recovery 
+full_recovery:
     // Step 2a: Verify modem is alive and SIM is ready.
     // Sends: AT, ATE0, AT+CPIN? — expects OK and +CPIN: READY.
     if (modem_check_sim(config) != 0) {
@@ -489,7 +617,7 @@ label: full_recovery
     }
     printf("Driver: PDP context active\n");
 
-label: redial 
+redial:
     // Step 2d: Switch UART from AT text to PPP binary.
     // Sends: ATD*99# — expects CONNECT. After this, no more AT commands.
     if (modem_enter_data_mode(config) != 0) {
@@ -502,48 +630,51 @@ label: redial
     // Step 3: PPP Phase 2 — hand UART to lwIP and bring up IP.
     // After modem_enter_data_mode() the UART carries binary PPP frames only.
     // No more AT; the driver must stop reading/writing this UART and let
-    // the PPP stack own it. Detailed TODO sequence:
-    
-    // TODO Phase 2.1 — Create PPP network interface
-    //   - esp_netif_config_t cfg = ESP_NETIF_DEFAULT_PPP();
-    //   - esp_netif_t *netif = esp_netif_new(&cfg);
-    //   - Can go wrong: esp_netif_new fails (e.g. no heap). Check for NULL;
+    // the PPP stack own it. Following sim_modem.c commenting structure.
+    // -----------------------------------------------------------------------
+
+    // Phase 2.1 — Create PPP network interface
+    //   esp_netif_config_t cfg = ESP_NETIF_DEFAULT_PPP();
+    //   esp_netif_t *netif = esp_netif_new(&cfg);
+    //   Can go wrong: esp_netif_new fails (e.g. no heap). Check for NULL;
     //     log and goto error if so.
-    Do as todo says
+    esp_netif_inherent_config_t base_netif_cfg = ESP_NETIF_INHERENT_DEFAULT_PPP();
+    base_netif_cfg.if_desc = "ppp_modem";
+    esp_netif_driver_ifconfig_t driver_cfg = {
+        .handle = (void *)config,
+        .transmit = ppp_transmit,
+    };
+    esp_netif_config_t netif_ppp_config = {
+        .base = &base_netif_cfg,
+        .driver = &driver_cfg,
+        .stack = ESP_NETIF_NETSTACK_DEFAULT_PPP,
+    };
+    esp_netif_t *netif = esp_netif_new(&netif_ppp_config);
+    if (netif == NULL) {
+        ESP_LOGE(TAG, "esp_netif_new(PPP) failed — no heap?");
+        goto error;
+    }
 
-    // TODO Phase 2.2 — Create PPPoS (PPP over serial) and bind to our UART
-    //   - Use the same config->uart_num that modem_driver_init installed.
-    //   - Typical: ppp_netif_pppos_create(netif, ppp_status_cb, ...) or
-    //     esp_netif_ppp_set_params() and a DTE that reads/writes config->uart_num.
-    //   - Can go wrong: UART already in use by this task — ensure no other
-    //     code (e.g. read_response) is called on this UART after data mode.
-    //     Can go wrong: Wrong uart_num or driver not installed; PPP will read
-    //     garbage or hang. Pass config->uart_num into the PPP init.
-    Do as todo says
-    log create PPPoS, bind to this UART, nothing else can use this UART
+    // Phase 2.2 — Create PPPoS (PPP over serial) and bind to our UART
+    //   Use the same config->uart_num that modem_driver_init installed.
+    //   PPP transmit callback (above) writes to config->uart_num; ppp_rx_task
+    //   reads from it and feeds esp_netif_receive. Nothing else uses this UART
+    //   after data mode — read_response/modem_send_at are not called.
+    //   Can go wrong: Wrong uart_num or driver not installed; PPP reads garbage.
+    ESP_LOGI(TAG, "PPPoS created, bound to UART%d — nothing else uses this UART", config->uart_num);
 
-    // TODO Phase 2.3 — Register netif and set as default (optional)
-    //   - esp_netif_attach(netif, ...) if using esp_modem; or register netif
-    //     so lwIP routes through it.
-    //   - Can go wrong: Netif not default — apps may try to use WiFi. Set
-    //     default route via this netif after IP is up.
-    register netif from 2.1
-    set the default netif to the PPP netif from 2.1 //Should fix that what can go wrong
-    log this
+    // Phase 2.3 — Register netif and set as default
+    //   Register netif so lwIP routes through it. Set default so apps use this
+    //   interface (not WiFi). Can go wrong: Netif not default — apps try WiFi.
+    esp_netif_set_default_netif(netif);
+    ESP_LOGI(TAG, "PPP netif registered and set as default");
 
-    // TODO Phase 2.4 — lwIP LCP/IPCP negotiation
-    //   - lwIP sends LCP Config-Request, then IPCP; the modem (or sim_modem)
-    //     replies. No extra code here — the PPP state machine runs on RX bytes.
-    //   - Can go wrong: LCP timeout — modem not sending Config-Ack; check
-    //     wiring and that sim_modem (or real modem) is in DATA_MODE. Can go
-    //     wrong: IPCP never completes — modem may not assign IP; check modem
-    //     logs. Can go wrong: MRU or option mismatch — sim accepts 1500; real
-    //     modems may Nak; lwIP should retry with adjusted options.
-    // This is abstracted away by the internal stack
-    // - lwIP (PPP state machine) does LCP and IPCP.
-    // - ESP-IDF (PPPoS / netif glue) connects that to the UART and to the esp_netif.
+    // Phase 2.4 — lwIP LCP/IPCP negotiation
+    //   lwIP (PPP state machine) does LCP and IPCP. ESP-IDF (PPPoS / netif glue)
+    //   connects that to the UART and to the esp_netif. No extra code here —
+    //   the PPP state machine runs on RX bytes fed by ppp_rx_task.
 
-    // TODO Phase 2.5 — Wait for IP address (PPP got IP)
+    // Phase 2.5 — Wait for IP address (PPP got IP)
     //   - Register for IP_EVENT_PPP_GOT_IP (or equivalent) or block until
     //     esp_netif_get_ip_info(netif, &info) shows a valid address (not 0.0.0.0).
     //   - Use a timeout (e.g. 30s); if no IP by then, log "PPP IP timeout" and
@@ -552,71 +683,85 @@ label: redial
     //     Can go wrong: Event not fired — ensure netif and PPP are registered
     //     with the event loop.
     // This uses branch statements instead of a loop to retry because some error types require starting further up the process
-    Register for IP_EVENT_PPP_GOT_IP (or equivalent) or block until (with timeout)
-    if success 
-        log success 
-        break loop 
-    if LCP timeout, LCP config reject, LCP config nak, IPCP timeout, IPCP config reject, IPCP config nak, Malformed or unexpected LCP/IPCP (no IP in 2.5), Transient PPP framing / FCS errors
-        getIP_fails++
-        log failure 
-        if getIP_fails > MAX_FAILS_GETIP
-            return fatal
-        goto redial 
-    if LCP Terminate, LCP Echo not answered, link dropped, Modem assigns 0.0.0.0, Modem drops to AT mode during negotiation, NO CARRIER or link-down during 2.4
-        getIP_fails++
-        log failure 
-        if getIP_fails > MAX_FAILS_GETIP
-            return fatal
-        goto full_recovery
-    if other error/failure 
-        log the failure 
-        return fatal 
-    if no IP after 30 seconds 
-        log PPP IP timeout 
-        if getIP_fails > MAX_FAILS_GETIP
-            return fatal
-        if getIP_fails > MAX_FAILS_GETIP/2
-            goto full_recovery
-        else 
-            goto redial 
+    if (s_ppp_evt == NULL) {
+        s_ppp_evt = xEventGroupCreate();
+    }
+    xEventGroupClearBits(s_ppp_evt, 0xFF);
 
-    insert list of 5 common NTPs 
-    for loop try up to 5 times
-        run time sync sequence 
-        if success 
-            log success 
-            break
-        if timeout, socket/network error, SNTP sync never completes
-            log failure 
-            wait 10 seconds 
-            try again
-        if DNS failure for NTP hostmane, invalid/bogus time
-            log failure
-            go to next NTP on list, based on for loop index 
-        if NTP/SNTP init failure, No NTP servers configured or invalid config 
-            log failure 
-            return fatal
+    ppp_phase_ctx_t ppp_ctx = {
+        .config = config,
+        .netif = netif,
+        .ppp_rx_stop = false,
+    };
 
-    if no success after loop 
-        return fatal 
-    else (success)
-        continue 
-    
+    esp_event_handler_instance_t ip_inst, status_inst;
+    esp_event_handler_instance_register(IP_EVENT, ESP_EVENT_ANY_ID, on_ppp_ip_event, NULL, &ip_inst);
+    esp_event_handler_instance_register(NETIF_PPP_STATUS, ESP_EVENT_ANY_ID, on_ppp_status_event, NULL, &status_inst);
 
-    // TODO Phase 2.6 — Use the link (sockets, DNS, TLS)
-    //   - Standard socket APIs (connect, send, recv) now use this interface
-    //     if it is the default. getaddrinfo() uses DNS (modem often provides
-    //     DNS via IPCP; sim_modem stub returns 10.0.0.1).
-    //   - Can go wrong: DNS fails — no route or wrong DNS server. Can go
-    //     wrong: TLS fails — often system time wrong; sync time (NTP) before
-    //     first HTTPS. Can go wrong: No carrier — modem drops PPP; handle
-    //     link-down and optionally re-run AT sequence.
-    //
-    // Reference: ESP-IDF examples/protocols/pppos_client
+    ppp_ctx.ppp_rx_stop = false;
+    if (xTaskCreate(ppp_rx_task, "ppp_rx", 4096, &ppp_ctx, 5, NULL) != pdPASS) {
+        ESP_LOGE(TAG, "Failed to create ppp_rx task");
+        esp_event_handler_instance_unregister(IP_EVENT, ESP_EVENT_ANY_ID, ip_inst);
+        esp_event_handler_instance_unregister(NETIF_PPP_STATUS, ESP_EVENT_ANY_ID, status_inst);
+        esp_netif_destroy(netif);
+        goto error;
+    }
+
+    esp_netif_action_start(netif, 0, 0, 0);
+    esp_netif_action_connected(netif, 0, 0, 0);
+
+    EventBits_t bits = xEventGroupWaitBits(s_ppp_evt,
+            PPP_GOT_IP_BIT | PPP_FAIL_REDIAL_BIT | PPP_FAIL_FULL_BIT | PPP_FAIL_FATAL_BIT,
+            pdFALSE, pdFALSE, pdMS_TO_TICKS(PPP_IP_TIMEOUT_MS));
+
+    ppp_ctx.ppp_rx_stop = true;
+    vTaskDelay(pdMS_TO_TICKS(200));
+
+    esp_event_handler_instance_unregister(IP_EVENT, ESP_EVENT_ANY_ID, ip_inst);
+    esp_event_handler_instance_unregister(NETIF_PPP_STATUS, ESP_EVENT_ANY_ID, status_inst);
+    esp_netif_action_disconnected(netif, 0, 0, 0);
+    esp_netif_action_stop(netif, 0, 0, 0);
+    esp_netif_destroy(netif);
+
+    if (bits & PPP_GOT_IP_BIT) {
+        ESP_LOGI(TAG, "PPP IP acquisition success");
+        printf("PPP Phase 2 complete — IP up\n");
+        goto idle;
+    }
+
+    getIP_fails++;
+    ESP_LOGW(TAG, "PPP IP failure (getIP_fails=%d)", getIP_fails);
+
+    if (getIP_fails > MAX_FAILS_GETIP) {
+        ESP_LOGE(TAG, "PPP IP failed %d times — fatal", getIP_fails);
+        goto error;
+    }
+
+    if (bits & PPP_FAIL_FATAL_BIT) {
+        ESP_LOGE(TAG, "PPP fatal error");
+        goto error;
+    }
+
+    if (bits & PPP_FAIL_FULL_BIT) {
+        modem_exit_data_mode(config);
+        goto full_recovery;
+    }
+
+    if (bits & PPP_FAIL_REDIAL_BIT) {
+        modem_exit_data_mode(config);
+        goto redial;
+    }
+
+    // Timeout: no IP after 30 seconds (pseudocode: no IP after 30 seconds)
+    ESP_LOGW(TAG, "PPP IP timeout (30s)");
+    modem_exit_data_mode(config);
+    if (getIP_fails > MAX_FAILS_GETIP / 2) {
+        goto full_recovery;
+    }
+    goto redial;
+
+    // Phase 2.6 — Use the link (sockets, DNS, TLS) — left for later per user request.
     // -----------------------------------------------------------------------
-
-    printf("=== All AT layers connected — PPP Phase 2 not yet implemented ===\n");
-    goto idle;
 
 error:
     config->state = MODEM_DRIVER_ERROR;

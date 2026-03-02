@@ -2,6 +2,8 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_log.h"
+#include "esp_netif.h"
+#include "esp_event.h"
 
 #include "sim_modem.h"
 #include "modem_driver.h"
@@ -112,6 +114,10 @@ void app_main(void)
         printf("Flow control: DISABLED\n");
     }
     printf("========================================\n\n");
+
+    // --- Initialize TCP/IP stack and event loop (required for PPP Phase 2) ---
+    ESP_ERROR_CHECK(esp_netif_init());
+    ESP_ERROR_CHECK(esp_event_loop_create_default());
 
     // --- Initialize both sides ---
     sim_modem_init(&sim_modem_cfg);
