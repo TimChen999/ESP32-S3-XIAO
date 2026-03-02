@@ -1,11 +1,11 @@
 #include "modem_driver.h"
 
+#include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
 #include <stdbool.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
-#include "freertos/event_groups.h"
 #include "esp_log.h"
 #include "esp_netif.h"
 #include "esp_netif_ppp.h"
@@ -471,15 +471,19 @@ int modem_enter_data_mode(modem_driver_config_t *config)
 // ---------------------------------------------------------------------------
 static int getIP_fails = 0;
 
-// PPP Phase 2 context: netif, config (for UART), and RX task control.
+// PPP Phase 2: volatile flags set by event handlers, polled by main loop.
 #define PPP_RX_BUF_SIZE 1024
 #define PPP_IP_TIMEOUT_MS 30000
 
-typedef struct {
-    modem_driver_config_t *config;
-    esp_netif_t *netif;
-    volatile bool ppp_rx_stop;
-} ppp_phase_ctx_t;
+typedef enum {
+    PPP_POLL_NONE = 0,
+    PPP_POLL_GOT_IP,
+    PPP_POLL_FAIL_REDIAL,
+    PPP_POLL_FAIL_FULL,
+    PPP_POLL_FAIL_FATAL,
+} ppp_poll_result_t;
+
+static volatile ppp_poll_result_t s_ppp_result = PPP_POLL_NONE;
 
 // Transmit callback: PPP stack calls this to send bytes to the modem.
 // handle is our config pointer (set in driver_cfg).
@@ -490,43 +494,15 @@ static esp_err_t ppp_transmit(void *handle, void *buffer, size_t len)
     return ESP_OK;
 }
 
-// PPP RX task: reads from UART, feeds esp_netif_receive. Runs until ppp_rx_stop.
-static void ppp_rx_task(void *arg)
-{
-    ppp_phase_ctx_t *ctx = (ppp_phase_ctx_t *)arg;
-    char *buf = malloc(PPP_RX_BUF_SIZE);
-    if (!buf) {
-        ESP_LOGE(TAG, "PPP RX task: malloc failed");
-        vTaskDelete(NULL);
-        return;
-    }
-    while (!ctx->ppp_rx_stop) {
-        int n = uart_read_bytes(ctx->config->uart_num, buf, PPP_RX_BUF_SIZE,
-                                pdMS_TO_TICKS(100));
-        if (n > 0) {
-            esp_netif_receive(ctx->netif, buf, (size_t)n, NULL);
-        }
-    }
-    free(buf);
-    vTaskDelete(NULL);
-}
-
-// Event group for Phase 2.5: wait for IP or error. Shared with handlers.
-static EventGroupHandle_t s_ppp_evt = NULL;
-static const int PPP_GOT_IP_BIT = BIT0;
-static const int PPP_FAIL_REDIAL_BIT = BIT1;   // goto redial
-static const int PPP_FAIL_FULL_BIT = BIT2;     // goto full_recovery
-static const int PPP_FAIL_FATAL_BIT = BIT3;    // return fatal
-
 static void on_ppp_ip_event(void *arg, esp_event_base_t base, int32_t id, void *data)
 {
     if (id == IP_EVENT_PPP_GOT_IP) {
         ip_event_got_ip_t *ev = (ip_event_got_ip_t *)data;
         ESP_LOGI(TAG, "PPP got IP: " IPSTR, IP2STR(&ev->ip_info.ip));
-        xEventGroupSetBits(s_ppp_evt, PPP_GOT_IP_BIT);
+        s_ppp_result = PPP_POLL_GOT_IP;
     } else if (id == IP_EVENT_PPP_LOST_IP) {
         ESP_LOGI(TAG, "PPP lost IP — link down");
-        xEventGroupSetBits(s_ppp_evt, PPP_FAIL_FULL_BIT);
+        s_ppp_result = PPP_POLL_FAIL_FULL;
     }
 }
 
@@ -537,14 +513,14 @@ static void on_ppp_status_event(void *arg, esp_event_base_t base, int32_t id, vo
     // full_recovery: LCP Terminate, link dropped, 0.0.0.0, NO CARRIER
     if (id >= NETIF_PPP_INTERNAL_ERR_OFFSET) {
         ESP_LOGE(TAG, "PPP internal error %ld", (long)id);
-        xEventGroupSetBits(s_ppp_evt, PPP_FAIL_FATAL_BIT);
+        s_ppp_result = PPP_POLL_FAIL_FATAL;
         return;
     }
     if (id >= NETIF_PP_PHASE_OFFSET) {
         if (id == NETIF_PPP_PHASE_TERMINATE || id == NETIF_PPP_PHASE_DEAD ||
             id == NETIF_PPP_PHASE_DISCONNECT) {
             ESP_LOGW(TAG, "PPP phase %ld — link down, full recovery", (long)id);
-            xEventGroupSetBits(s_ppp_evt, PPP_FAIL_FULL_BIT);
+            s_ppp_result = PPP_POLL_FAIL_FULL;
         }
         return;
     }
@@ -555,17 +531,17 @@ static void on_ppp_status_event(void *arg, esp_event_base_t base, int32_t id, vo
         case NETIF_PPP_ERRORIDLETIMEOUT:
         case NETIF_PPP_ERRORCONNECTTIME:
             ESP_LOGW(TAG, "PPP error %ld — transient, redial", (long)id);
-            xEventGroupSetBits(s_ppp_evt, PPP_FAIL_REDIAL_BIT);
+            s_ppp_result = PPP_POLL_FAIL_REDIAL;
             break;
         case NETIF_PPP_ERRORCONNECT:
         case NETIF_PPP_ERROROPEN:
         case NETIF_PPP_ERRORDEVICE:
             ESP_LOGW(TAG, "PPP error %ld — link/device, full recovery", (long)id);
-            xEventGroupSetBits(s_ppp_evt, PPP_FAIL_FULL_BIT);
+            s_ppp_result = PPP_POLL_FAIL_FULL;
             break;
         default:
             ESP_LOGE(TAG, "PPP error %ld — fatal", (long)id);
-            xEventGroupSetBits(s_ppp_evt, PPP_FAIL_FATAL_BIT);
+            s_ppp_result = PPP_POLL_FAIL_FATAL;
             break;
     }
 }
@@ -657,7 +633,7 @@ redial:
 
     // Phase 2.2 — Create PPPoS (PPP over serial) and bind to our UART
     //   Use the same config->uart_num that modem_driver_init installed.
-    //   PPP transmit callback (above) writes to config->uart_num; ppp_rx_task
+    //   PPP transmit callback (above) writes to config->uart_num; polling loop
     //   reads from it and feeds esp_netif_receive. Nothing else uses this UART
     //   after data mode — read_response/modem_send_at are not called.
     //   Can go wrong: Wrong uart_num or driver not installed; PPP reads garbage.
@@ -672,7 +648,7 @@ redial:
     // Phase 2.4 — lwIP LCP/IPCP negotiation
     //   lwIP (PPP state machine) does LCP and IPCP. ESP-IDF (PPPoS / netif glue)
     //   connects that to the UART and to the esp_netif. No extra code here —
-    //   the PPP state machine runs on RX bytes fed by ppp_rx_task.
+    //   the PPP state machine runs on RX bytes fed by the polling loop.
 
     // Phase 2.5 — Wait for IP address (PPP got IP)
     //   - Register for IP_EVENT_PPP_GOT_IP (or equivalent) or block until
@@ -682,40 +658,43 @@ redial:
     //   - Can go wrong: Timeout — LCP/IPCP failed or modem didn’t assign IP.
     //     Can go wrong: Event not fired — ensure netif and PPP are registered
     //     with the event loop.
-    // This uses branch statements instead of a loop to retry because some error types require starting further up the process
-    if (s_ppp_evt == NULL) {
-        s_ppp_evt = xEventGroupCreate();
-    }
-    xEventGroupClearBits(s_ppp_evt, 0xFF);
-
-    ppp_phase_ctx_t ppp_ctx = {
-        .config = config,
-        .netif = netif,
-        .ppp_rx_stop = false,
-    };
+    // Sequential polling loop — no ppp_rx_task, no race conditions.
+    s_ppp_result = PPP_POLL_NONE;
 
     esp_event_handler_instance_t ip_inst, status_inst;
     esp_event_handler_instance_register(IP_EVENT, ESP_EVENT_ANY_ID, on_ppp_ip_event, NULL, &ip_inst);
     esp_event_handler_instance_register(NETIF_PPP_STATUS, ESP_EVENT_ANY_ID, on_ppp_status_event, NULL, &status_inst);
 
-    ppp_ctx.ppp_rx_stop = false;
-    if (xTaskCreate(ppp_rx_task, "ppp_rx", 4096, &ppp_ctx, 5, NULL) != pdPASS) {
-        ESP_LOGE(TAG, "Failed to create ppp_rx task");
+    esp_netif_action_start(netif, 0, 0, 0);
+    esp_netif_action_connected(netif, 0, 0, 0);
+
+    char *ppp_buf = malloc(PPP_RX_BUF_SIZE);
+    if (ppp_buf == NULL) {
+        ESP_LOGE(TAG, "PPP RX buffer malloc failed");
         esp_event_handler_instance_unregister(IP_EVENT, ESP_EVENT_ANY_ID, ip_inst);
         esp_event_handler_instance_unregister(NETIF_PPP_STATUS, ESP_EVENT_ANY_ID, status_inst);
+        esp_netif_action_disconnected(netif, 0, 0, 0);
+        esp_netif_action_stop(netif, 0, 0, 0);
         esp_netif_destroy(netif);
         goto error;
     }
 
-    esp_netif_action_start(netif, 0, 0, 0);
-    esp_netif_action_connected(netif, 0, 0, 0);
+    TickType_t deadline = xTaskGetTickCount() + pdMS_TO_TICKS(PPP_IP_TIMEOUT_MS);
+    ppp_poll_result_t result = PPP_POLL_NONE;
 
-    EventBits_t bits = xEventGroupWaitBits(s_ppp_evt,
-            PPP_GOT_IP_BIT | PPP_FAIL_REDIAL_BIT | PPP_FAIL_FULL_BIT | PPP_FAIL_FATAL_BIT,
-            pdFALSE, pdFALSE, pdMS_TO_TICKS(PPP_IP_TIMEOUT_MS));
+    while (xTaskGetTickCount() < deadline) {
+        int n = uart_read_bytes(config->uart_num, ppp_buf, PPP_RX_BUF_SIZE,
+                                pdMS_TO_TICKS(100));
+        if (n > 0) {
+            esp_netif_receive(netif, ppp_buf, (size_t)n, NULL);
+        }
+        result = s_ppp_result;
+        if (result != PPP_POLL_NONE) {
+            break;
+        }
+    }
 
-    ppp_ctx.ppp_rx_stop = true;
-    vTaskDelay(pdMS_TO_TICKS(200));
+    free(ppp_buf);
 
     esp_event_handler_instance_unregister(IP_EVENT, ESP_EVENT_ANY_ID, ip_inst);
     esp_event_handler_instance_unregister(NETIF_PPP_STATUS, ESP_EVENT_ANY_ID, status_inst);
@@ -723,7 +702,7 @@ redial:
     esp_netif_action_stop(netif, 0, 0, 0);
     esp_netif_destroy(netif);
 
-    if (bits & PPP_GOT_IP_BIT) {
+    if (result == PPP_POLL_GOT_IP) {
         ESP_LOGI(TAG, "PPP IP acquisition success");
         printf("PPP Phase 2 complete — IP up\n");
         goto idle;
@@ -737,17 +716,17 @@ redial:
         goto error;
     }
 
-    if (bits & PPP_FAIL_FATAL_BIT) {
+    if (result == PPP_POLL_FAIL_FATAL) {
         ESP_LOGE(TAG, "PPP fatal error");
         goto error;
     }
 
-    if (bits & PPP_FAIL_FULL_BIT) {
+    if (result == PPP_POLL_FAIL_FULL) {
         modem_exit_data_mode(config);
         goto full_recovery;
     }
 
-    if (bits & PPP_FAIL_REDIAL_BIT) {
+    if (result == PPP_POLL_FAIL_REDIAL) {
         modem_exit_data_mode(config);
         goto redial;
     }

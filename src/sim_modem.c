@@ -234,23 +234,71 @@ static sim_modem_state_t handle_at_command(sim_modem_config_t *config,
 #define SIM_DNS_IP      {10, 0, 0, 1}
 
 // ---------------------------------------------------------------------------
+//  PPP Async HDLC framing (RFC 1662) — real modem behavior
+//
+//  Real cellular modems (SIM7600, BG96, etc.) speak standard PPP over async
+//  serial. The MCU (lwIP) and modem exchange PPP frames using:
+//
+//  1. HDLC-like framing: frames are delimited by 0x7E (FLAG). Consecutive
+//     flags are legal fill between frames.
+//
+//  2. Byte stuffing (escaping): To avoid 0x7E and 0x7D in the payload being
+//     mistaken for flags or escape sequences, RFC 1662 defines:
+//       - 0x7E in payload → send 0x7D 0x5E (escape + 0x7E^0x20)
+//       - 0x7D in payload → send 0x7D 0x5D (escape + 0x7D^0x20)
+//       - Other chars in ACCM → 0x7D (char^0x20)
+//     The modem RECEIVES stuffed bytes, UNSTUFFS before parsing, STUFFS before
+//     sending. We mirror that.
+//
+//  3. Frame format on wire:
+//     [0x7E] [stuffed payload: addr 0xFF, ctrl 0x03, protocol, data] [FCS 2B] [0x7E]
+//     We omit FCS for simplicity (sim); real modems verify it.
+//
+//  4. Data flow (mirrors real modem):
+//     MCU sends: 0x7E [0x7D 0x5F 0x7D 0x23 0xC0 0x21 ...] 0x7E  (stuffed)
+//     Modem receives, unstuffs: 0xFF 0x03 0xC021 ... (logical frame)
+//     Modem sends: 0x7E [stuffed response] 0x7E
+//     MCU receives, unstuffs (lwIP does this).
+//
+//  This sim acts as the modem: we unstuff on RX, stuff on TX.
+// ---------------------------------------------------------------------------
+
+#define PPP_FLAG_BYTE    0x7E
+#define PPP_ESCAPE_BYTE  0x7D
+#define PPP_TRANS_BYTE   0x20
+
+// ---------------------------------------------------------------------------
 //  send_ppp_frame
 //
-//  Wraps payload in 0x7E delimiters and writes to UART.
-//  Reused by LCP, IPCP, and IPv4 response senders.
+//  Wraps payload in 0x7E delimiters, applies byte stuffing (RFC 1662), and
+//  writes to UART. Real modems stuff 0x7E and 0x7D (and ACCM chars) before
+//  transmit so the peer can parse frames correctly.
 // ---------------------------------------------------------------------------
 static void send_ppp_frame(sim_modem_config_t *config,
                            const unsigned char *frame, size_t len,
                            unsigned char ppp_flag)
 {
-    // What goes on the wire (Transmit sequence):
-    //   [0:1, 0x7E flag (frame start)] [1:1+len, frame payload] [1+len:2+len, 0x7E flag (frame end)]
-    //
-    // Payload itself is structured by whatever calls it:
-    //   [0:1, 0xFF addr] [1:2, 0x03 ctrl] [2:4, protocol ID] [4:len, protocol-specific data]
-    uart_write_bytes(config->uart_num, (const char *)&ppp_flag, 1);  // opening delimiter
-    uart_write_bytes(config->uart_num, (const char *)frame, len);    // payload (addr+ctrl+proto+data)
-    uart_write_bytes(config->uart_num, (const char *)&ppp_flag, 1);  // closing delimiter
+    unsigned char tx_buf[1024];
+    size_t tx_len = 0;
+
+    uart_write_bytes(config->uart_num, (const char *)&ppp_flag, 1);  // opening 0x7E
+
+    for (size_t i = 0; i < len && tx_len < sizeof(tx_buf) - 2; i++) {
+        unsigned char c = frame[i];
+        if (c == PPP_FLAG_BYTE) {
+            tx_buf[tx_len++] = PPP_ESCAPE_BYTE;
+            tx_buf[tx_len++] = c ^ PPP_TRANS_BYTE;  // 0x5E
+        } else if (c == PPP_ESCAPE_BYTE) {
+            tx_buf[tx_len++] = PPP_ESCAPE_BYTE;
+            tx_buf[tx_len++] = c ^ PPP_TRANS_BYTE;  // 0x5D
+        } else {
+            tx_buf[tx_len++] = c;
+        }
+    }
+    if (tx_len > 0) {
+        uart_write_bytes(config->uart_num, (const char *)tx_buf, tx_len);
+    }
+    uart_write_bytes(config->uart_num, (const char *)&ppp_flag, 1);  // closing 0x7E
 }
 
 // ---------------------------------------------------------------------------
@@ -834,16 +882,17 @@ static void handle_ipv4_packet(sim_modem_config_t *config,
 
 static void handle_ppp_data_mode(sim_modem_config_t *config)
 {
-    // We keep this handler byte-oriented (not line-oriented) because PPP is
-    // binary and may contain arbitrary bytes.
-    static const unsigned char PPP_FLAG = 0x7E;
+    // Byte-oriented handler: PPP is binary. We read raw bytes, unstuff (RFC 1662),
+    // accumulate until 0x7E delimiter, then dispatch by protocol.
     unsigned char byte = 0;
     unsigned char frame_buf[512];
     size_t frame_len = 0;
 
-    // Step 7: Track consecutive '+' bytes for escape detection.
-    // Real modems require: 1s silence, "+++", 1s silence → back to AT mode.
-    // We simplify: 3 consecutive '+' bytes with no other data in between.
+    // Unstuffing state: 0x7D on wire means "next byte XOR 0x20". Real modems
+    // receive stuffed bytes from the MCU and unstuff before parsing.
+    int in_escaped = 0;
+
+    // Step 7: Track consecutive '+' for escape (return to AT mode).
     int plus_count = 0;
 
     ESP_LOGI(TAG, "Entered PPP data mode — collecting HDLC frames");
@@ -872,32 +921,33 @@ static void handle_ppp_data_mode(sim_modem_config_t *config)
             plus_count = 0;
         }
 
-        // Step 2: PPP frame delimiter 0x7E found (HDLC flag bytes).
-        if (byte == PPP_FLAG) {
-            // Consecutive flags are legal fill between frames.
+        // --- Byte unstuffing (RFC 1662) — real modem behavior ---
+        // The MCU (lwIP) sends stuffed bytes: 0x7D 0x5E = 0x7E, 0x7D 0x5D = 0x7D.
+        // We unstuff before treating 0x7E as frame boundary or accumulating.
+        if (in_escaped) {
+            byte ^= PPP_TRANS_BYTE;
+            in_escaped = 0;
+        } else if (byte == PPP_ESCAPE_BYTE) {
+            in_escaped = 1;
+            continue;
+        }
+
+        // Frame delimiter: 0x7E (after unstuffing) marks frame boundaries.
+        if (byte == PPP_FLAG_BYTE) {
             if (frame_len == 0) {
                 continue;
             }
 
-            // Frame boundary reached — we now have one complete PPP frame.
-            // PPP header: Address(0xFF), Control(0x03), Protocol(2B).
+            // Complete frame. PPP header: Address(0xFF), Control(0x03), Protocol(2B).
             if (frame_len >= 4 && frame_buf[0] == 0xFF && frame_buf[1] == 0x03) {
-                // Protocol field = frame_buf[2:4] (big-endian).
-                // Determines which handler processes the payload.
                 unsigned short protocol = ((unsigned short)frame_buf[2] << 8) | frame_buf[3];
 
                 if (protocol == 0xC021) {
-                    // Step 3: LCP — link parameter negotiation (must complete first).
-                    handle_lcp_frame(config, frame_buf, frame_len, PPP_FLAG);
-
+                    handle_lcp_frame(config, frame_buf, frame_len, PPP_FLAG_BYTE);
                 } else if (protocol == 0x8021) {
-                    // Step 4: IPCP — IP address assignment (after LCP opens).
-                    handle_ipcp_frame(config, frame_buf, frame_len, PPP_FLAG);
-
+                    handle_ipcp_frame(config, frame_buf, frame_len, PPP_FLAG_BYTE);
                 } else if (protocol == 0x0021) {
-                    // Steps 5 & 6: IPv4 — real IP packets (after IPCP opens).
-                    handle_ipv4_packet(config, frame_buf, frame_len, PPP_FLAG);
-
+                    handle_ipv4_packet(config, frame_buf, frame_len, PPP_FLAG_BYTE);
                 } else {
                     ESP_LOGI(TAG, "PPP frame: unhandled proto=0x%04X (len=%u)",
                              protocol, (unsigned int)frame_len);
@@ -907,16 +957,13 @@ static void handle_ppp_data_mode(sim_modem_config_t *config)
                          (unsigned int)frame_len);
             }
 
-            // Ready for next frame.
             frame_len = 0;
             continue;
         }
 
-        // Accumulate frame bytes until the next 0x7E delimiter.
         if (frame_len < sizeof(frame_buf)) {
             frame_buf[frame_len++] = byte;
         } else {
-            // Overflow guard: drop this frame and wait for next delimiter.
             ESP_LOGW(TAG, "PPP frame overflow; dropping partial frame");
             frame_len = 0;
         }
