@@ -14,15 +14,13 @@
 
 static const char *TAG = "MODEM_DRV";
 
-// SIM PIN: in a real product this would come from a config file or secure storage.
+// SIM PIN: Set modem PIN TODO: This should come from some config file or smth
 #define DEFAULT_SIM_PIN "0000"
 
 // MAX FAILURES: the max number of time modem handshake can fail before fatal
 #define MAX_FAILS_GETIP 10
 
-// Echo state: set to true when ATE0 succeeds so read_response can skip stripping.
-// When false, the modem may still be echoing commands; read_response strips the
-// first line (echoed command + \r\n) so the buffer starts with the modem reply.
+// Echo state: Will it echo? True when ATE0 succeeds so read_response can skip stripping
 static bool g_echo_disabled = false;
 
 // ============================================================================
@@ -59,11 +57,6 @@ static void send_command_raw(modem_driver_config_t *config, const char *cmd)
 //    3. If found, return the total length so caller can parse with strstr()
 //    4. If timeout (got <= 0), return -1; if buffer full without terminator,
 //       return -1 (garbled — caller may flush and retry)
-//
-//  Echo: g_echo_disabled is set when ATE0 succeeds. When it is false, the buffer
-//  may start with the echoed command plus \r\n; we strip that first line so
-//  the returned buffer starts with the modem's response. When g_echo_disabled
-//  is true we return the buffer as-is.
 // ---------------------------------------------------------------------------
 static int read_response(modem_driver_config_t *config,
                          char *buf, size_t buf_size,
@@ -84,6 +77,7 @@ static int read_response(modem_driver_config_t *config,
 
         if (strstr(buf, "OK") || strstr(buf, "ERROR") ||
             strstr(buf, "CONNECT") || strstr(buf, "NO CARRIER")) {
+            // Echo not disabled, strip the echoed part out
             if (!g_echo_disabled) {
                 char *first_crlf = strstr(buf, "\r\n");
                 if (first_crlf != NULL && (size_t)(first_crlf - buf) < len) {
@@ -119,8 +113,7 @@ static bool response_contains(const char *response, const char *needle)
 
 void modem_driver_init(modem_driver_config_t *config)
 {
-    // 1. Set initial state to IDLE so the task knows no commands have been
-    //    sent yet. The task will advance state through the AT sequence.
+    // 1. Set state variable in config to IDLE (init), used for debug/observability
     config->state = MODEM_DRIVER_IDLE;
 
     // 2. Describe the UART's electrical parameters: baud rate, word format,
@@ -417,9 +410,7 @@ int modem_activate_pdp(modem_driver_config_t *config)
 //  modem_exit_data_mode
 //
 //  Sends +++ with guard time to return modem from PPP data mode to AT mode.
-//  Required before retrying (goto redial/full_recovery) — otherwise modem
-//  stays in DATA_MODE and won't process ATD*99# or AT commands.
-//  Sim_modem detects 3 consecutive '+' then timeout → state PDP_ACTIVE.
+//  Required before retrying (redial/full_recovery), modem can process AT#99
 // ---------------------------------------------------------------------------
 static void modem_exit_data_mode(modem_driver_config_t *config)
 {
@@ -466,8 +457,7 @@ int modem_enter_data_mode(modem_driver_config_t *config)
 //  Tracks consecutive PPP IP acquisition failures. Used by Phase 2.5 branch
 //  logic: transient errors (LCP/IPCP timeout, config reject/nak) → goto redial;
 //  link-down errors (LCP Terminate, 0.0.0.0, NO CARRIER) → goto full_recovery.
-//  When getIP_fails > MAX_FAILS_GETIP we return fatal. When > MAX_FAILS_GETIP/2
-//  we prefer full_recovery over redial for timeout case (pseudocode 2.5).
+//  When getIP_fails > MAX_FAILS_GETIP we return fatal. 
 // ---------------------------------------------------------------------------
 static int getIP_fails = 0;
 
@@ -475,6 +465,7 @@ static int getIP_fails = 0;
 #define PPP_RX_BUF_SIZE 1024
 #define PPP_IP_TIMEOUT_MS 30000
 
+// What happened during PPP Phase 2 (LCP/IPCP negotiation after data mode).
 typedef enum {
     PPP_POLL_NONE = 0,
     PPP_POLL_GOT_IP,
@@ -483,10 +474,12 @@ typedef enum {
     PPP_POLL_FAIL_FATAL,
 } ppp_poll_result_t;
 
+// This changes asynchronously through PPP events
 static volatile ppp_poll_result_t s_ppp_result = PPP_POLL_NONE;
 
 // Transmit callback: PPP stack calls this to send bytes to the modem.
 // handle is our config pointer (set in driver_cfg).
+// PPP stack (lwIP) uses this function to drive data thru UART (passed thru netif config)
 static esp_err_t ppp_transmit(void *handle, void *buffer, size_t len)
 {
     modem_driver_config_t *cfg = (modem_driver_config_t *)handle;
@@ -494,6 +487,7 @@ static esp_err_t ppp_transmit(void *handle, void *buffer, size_t len)
     return ESP_OK;
 }
 
+// Async handler function, posts event when PPP gets or loses an IP address
 static void on_ppp_ip_event(void *arg, esp_event_base_t base, int32_t id, void *data)
 {
     if (id == IP_EVENT_PPP_GOT_IP) {
@@ -506,6 +500,7 @@ static void on_ppp_ip_event(void *arg, esp_event_base_t base, int32_t id, void *
     }
 }
 
+// Async function, post when link fails or changes state
 static void on_ppp_status_event(void *arg, esp_event_base_t base, int32_t id, void *data)
 {
     // Map NETIF_PPP_STATUS to redial vs full_recovery vs fatal (pseudocode 2.5).
@@ -612,8 +607,6 @@ redial:
     // Phase 2.1 — Create PPP network interface
     //   esp_netif_config_t cfg = ESP_NETIF_DEFAULT_PPP();
     //   esp_netif_t *netif = esp_netif_new(&cfg);
-    //   Can go wrong: esp_netif_new fails (e.g. no heap). Check for NULL;
-    //     log and goto error if so.
     esp_netif_inherent_config_t base_netif_cfg = ESP_NETIF_INHERENT_DEFAULT_PPP();
     base_netif_cfg.if_desc = "ppp_modem";
     esp_netif_driver_ifconfig_t driver_cfg = {
@@ -625,18 +618,16 @@ redial:
         .driver = &driver_cfg,
         .stack = ESP_NETIF_NETSTACK_DEFAULT_PPP,
     };
+    //   If esp_netif_new fails (e.g. no heap). Check for NULL;
+    //   log and goto error if so.
     esp_netif_t *netif = esp_netif_new(&netif_ppp_config);
     if (netif == NULL) {
         ESP_LOGE(TAG, "esp_netif_new(PPP) failed — no heap?");
         goto error;
     }
 
-    // Phase 2.2 — Create PPPoS (PPP over serial) and bind to our UART
-    //   Use the same config->uart_num that modem_driver_init installed.
-    //   PPP transmit callback (above) writes to config->uart_num; polling loop
-    //   reads from it and feeds esp_netif_receive. Nothing else uses this UART
-    //   after data mode — read_response/modem_send_at are not called.
-    //   Can go wrong: Wrong uart_num or driver not installed; PPP reads garbage.
+    // Phase 2.2 — Document: PPPoS (PPP over serial) created in the previous step
+    // should be bound to this UART, make sure nothing else is bound to it
     ESP_LOGI(TAG, "PPPoS created, bound to UART%d — nothing else uses this UART", config->uart_num);
 
     // Phase 2.3 — Register netif and set as default
@@ -645,31 +636,34 @@ redial:
     esp_netif_set_default_netif(netif);
     ESP_LOGI(TAG, "PPP netif registered and set as default");
 
-    // Phase 2.4 — lwIP LCP/IPCP negotiation
-    //   lwIP (PPP state machine) does LCP and IPCP. ESP-IDF (PPPoS / netif glue)
-    //   connects that to the UART and to the esp_netif. No extra code here —
-    //   the PPP state machine runs on RX bytes fed by the polling loop.
-
-    // Phase 2.5 — Wait for IP address (PPP got IP)
-    //   - Register for IP_EVENT_PPP_GOT_IP (or equivalent) or block until
-    //     esp_netif_get_ip_info(netif, &info) shows a valid address (not 0.0.0.0).
-    //   - Use a timeout (e.g. 30s); if no IP by then, log "PPP IP timeout" and
-    //     goto error.
-    //   - Can go wrong: Timeout — LCP/IPCP failed or modem didn’t assign IP.
-    //     Can go wrong: Event not fired — ensure netif and PPP are registered
-    //     with the event loop.
-    // Sequential polling loop — no ppp_rx_task, no race conditions.
+    // Phase 2.4 — Document: lwIP (PPP state machine) does LCP and IPCP. ESP-IDF 
+    // (PPPoS / netif glue), connects that to the UART and to the esp_netif. 
+    // This bulk of this process happens backend, check result in 2.5
     s_ppp_result = PPP_POLL_NONE;
 
+    // Registers IP_EVENT (on_ppp_ip_event) and NETIF_PPP_STATUS (on_ppp_status_event)
+    // Provides handlers so they can be unregistered later
     esp_event_handler_instance_t ip_inst, status_inst;
     esp_event_handler_instance_register(IP_EVENT, ESP_EVENT_ANY_ID, on_ppp_ip_event, NULL, &ip_inst);
     esp_event_handler_instance_register(NETIF_PPP_STATUS, ESP_EVENT_ANY_ID, on_ppp_status_event, NULL, &status_inst);
 
+    // Starts and connect the network interface itself, preps PPP machine to run
+    // Connects link layer, gives PPP serial link so it can being negotiation between ESP and Modem
+    // Decide on MRU, authentication, compression, protocols
     esp_netif_action_start(netif, 0, 0, 0);
     esp_netif_action_connected(netif, 0, 0, 0);
 
+    // Phase 2.5 — Wait for IP address (PPP got IP)
+    //   - Register for IP_EVENT_PPP_GOT_IP (or equivalent) or block until
+    //     esp_netif_get_ip_info(netif, &info) shows a valid address (not 0.0.0.0).
+    //   - Can go wrong: Timeout — LCP/IPCP failed or modem didn’t assign IP.
+    //     Can go wrong: Event not fired — ensure netif and PPP are registered
+    //     with the event loop.
+
+    // Allocates a buffer for incoming PPP frames from UART
     char *ppp_buf = malloc(PPP_RX_BUF_SIZE);
     if (ppp_buf == NULL) {
+        // Allocation failed, go error
         ESP_LOGE(TAG, "PPP RX buffer malloc failed");
         esp_event_handler_instance_unregister(IP_EVENT, ESP_EVENT_ANY_ID, ip_inst);
         esp_event_handler_instance_unregister(NETIF_PPP_STATUS, ESP_EVENT_ANY_ID, status_inst);
@@ -679,29 +673,38 @@ redial:
         goto error;
     }
 
+    // Use a timeout (e.g. 30s); if no IP by then, log "PPP IP timeout" and goto error.
     TickType_t deadline = xTaskGetTickCount() + pdMS_TO_TICKS(PPP_IP_TIMEOUT_MS);
     ppp_poll_result_t result = PPP_POLL_NONE;
 
+    // Sequential polling loop — no ppp_rx_task, no race conditions.
     while (xTaskGetTickCount() < deadline) {
+        // Read as bytes arrive from UART, stores up to its buffer size
         int n = uart_read_bytes(config->uart_num, ppp_buf, PPP_RX_BUF_SIZE,
-                                pdMS_TO_TICKS(100));
+                                pdMS_TO_TICKS(100));                  
+        // Passed read bytes to netif, the IP is then stored in netif
         if (n > 0) {
             esp_netif_receive(netif, ppp_buf, (size_t)n, NULL);
         }
-        result = s_ppp_result;
+        // Holds the result of initial negotiation, ppp result set by event handlers
+        result = s_ppp_result; 
         if (result != PPP_POLL_NONE) {
-            break;
+            // When result becomes a not none value, negotiation finished
+            break; 
         }
     }
 
+    // Unregister handlers, remove network interface
+    // TODO: Keep this after finishing 2.6, this is responsible for continuous data transfer
+    // Done, free buffer
     free(ppp_buf);
-
     esp_event_handler_instance_unregister(IP_EVENT, ESP_EVENT_ANY_ID, ip_inst);
     esp_event_handler_instance_unregister(NETIF_PPP_STATUS, ESP_EVENT_ANY_ID, status_inst);
     esp_netif_action_disconnected(netif, 0, 0, 0);
     esp_netif_action_stop(netif, 0, 0, 0);
     esp_netif_destroy(netif);
 
+    // Result of 
     if (result == PPP_POLL_GOT_IP) {
         ESP_LOGI(TAG, "PPP IP acquisition success");
         printf("PPP Phase 2 complete — IP up\n");
