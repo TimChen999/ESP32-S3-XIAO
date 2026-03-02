@@ -45,31 +45,31 @@
 //    sent over the UART to the modem, which forwards them to the network.
 //
 //  ┌────────────────────────────────────────────────────────────────────┐
-//  │                     NETWORKING LAYER MAP                          │
+//  │                     NETWORKING LAYER MAP                           │
 //  ├──────────────┬─────────────────────────────────────────────────────┤
-//  │ Layer 7      │ Application (HTTP, MQTT, CoAP)                     │
-//  │ (App)        │   → Your app code, calls socket APIs               │
+//  │ Layer 7      │ Application (HTTP, MQTT, CoAP)                      │
+//  │ (App)        │   → Your app code, calls socket APIs                │
 //  │              │   → Runs AFTER this driver brings the link up       │
 //  ├──────────────┼─────────────────────────────────────────────────────┤
-//  │ Layer 4      │ TCP / UDP                                          │
-//  │ (Transport)  │   → lwIP handles this automatically                │
+//  │ Layer 4      │ TCP / UDP                                           │
+//  │ (Transport)  │   → lwIP handles this automatically                 │
 //  │              │   → You call connect(), send(), recv()              │
 //  ├──────────────┼─────────────────────────────────────────────────────┤
-//  │ Layer 3      │ IP                                                 │
-//  │ (Network)    │   → lwIP handles this automatically                │
+//  │ Layer 3      │ IP                                                  │
+//  │ (Network)    │   → lwIP handles this automatically                 │
 //  │              │   → IP address assigned during IPCP negotiation     │
 //  ├──────────────┼─────────────────────────────────────────────────────┤
-//  │ Layer 2      │ PPP (Point-to-Point Protocol)                      │
-//  │ (Data Link)  │   → lwIP PPP client handles HDLC framing           │
+//  │ Layer 2      │ PPP (Point-to-Point Protocol)                       │
+//  │ (Data Link)  │   → lwIP PPP client handles HDLC framing            │
 //  │              │   → Negotiates LCP (link params) and IPCP (IP addr) │
-//  │              │   ★ modem_enter_data_mode() triggers this phase ★   │
+//  │              │   ★ modem_enter_data_mode() triggers this phase ★  │
 //  ├──────────────┼─────────────────────────────────────────────────────┤
-//  │ Layer 1      │ Physical: UART                                     │
+//  │ Layer 1      │ Physical: UART                                      │
 //  │ (Physical)   │   → modem_driver_init() sets up this layer          │
 //  │              │   → modem_send_at() reads/writes raw bytes here     │
 //  ├──────────────┼─────────────────────────────────────────────────────┤
-//  │ Control      │ AT Command Interface (pre-PPP)                     │
-//  │ Plane        │   ★ THIS IS WHERE MOST OF THIS FILE OPERATES ★    │
+//  │ Control      │ AT Command Interface (pre-PPP)                      │
+//  │ Plane        │   ★ THIS IS WHERE MOST OF THIS FILE OPERATES ★     │
 //  │              │   → modem_send_at(): lowest-level AT send/receive   │
 //  │              │   → modem_check_sim(): SIM/modem validation         │
 //  │              │   → modem_register_network(): cellular registration │
@@ -90,6 +90,49 @@
 //  here knows or cares that sim_modem.c exists on the other UART.
 //
 // ============================================================================
+//  HOW OTHER FILES INTERFACE WITH THIS DRIVER (Phase 2.6)
+// ============================================================================
+//
+//  Once modem_driver_task reaches Phase 2.6, the PPP netif is the default
+//  interface. Any code (in other tasks or files) can use standard APIs:
+//
+//  1. CHECK LINK STATE (optional):
+//       if (modem_driver_get_state() == MODEM_DRIVER_IP_UP) { ... }
+//
+//  2. SOCKETS (TCP/UDP):
+//       #include <sys/socket.h>
+//       #include <netdb.h>
+//       int fd = socket(AF_INET, SOCK_STREAM, 0);
+//       struct sockaddr_in addr = { .sin_family = AF_INET, .sin_port = htons(443), ... };
+//       inet_pton(AF_INET, "142.250.80.46", &addr.sin_addr);  // or use getaddrinfo for DNS
+//       connect(fd, (struct sockaddr *)&addr, sizeof(addr));
+//       send(fd, data, len, 0);
+//       recv(fd, buf, sizeof(buf), 0);
+//
+//  3. DNS:
+//       struct hostent *he = gethostbyname("generativelanguage.googleapis.com");
+//       // Then use he->h_addr_list[0] in sockaddr_in
+//
+//  4. HTTP (esp_http_client component):
+//       #include "esp_http_client.h"
+//       esp_http_client_config_t cfg = { .url = "https://example.com", ... };
+//       esp_http_client_handle_t client = esp_http_client_init(&cfg);
+//       esp_http_client_perform(client);  // GET by default
+//       esp_http_client_cleanup(client);
+//
+//  5. HTTPS / TLS (Gemini API, etc.):
+//       Use esp_http_client with .url = "https://..." — ESP-IDF uses mbedTLS.
+//       For Gemini: POST to https://generativelanguage.googleapis.com/... with
+//       JSON body and API key in header.
+//
+//  6. MQTT, CoAP, custom protocols:
+//       Same pattern — create sockets or use ESP-IDF components; traffic
+//       automatically routes through the default PPP netif.
+//
+//  The modem_driver_task runs the PPP RX loop; your code runs in other tasks.
+//  Ensure modem_driver_get_state() == MODEM_DRIVER_IP_UP before using the network.
+//
+// ============================================================================
 
 typedef enum {
     MODEM_DRIVER_IDLE,
@@ -97,6 +140,7 @@ typedef enum {
     MODEM_DRIVER_REGISTERED,
     MODEM_DRIVER_PDP_ACTIVE,
     MODEM_DRIVER_DATA_MODE,
+    MODEM_DRIVER_IP_UP,       // PPP link up, IP assigned — sockets/DNS/TLS usable
     MODEM_DRIVER_ERROR,
 } modem_driver_state_t;
 
@@ -110,6 +154,15 @@ typedef struct {
     bool flow_control;             // true = enable RTS/CTS hardware flow control
     modem_driver_state_t state;
 } modem_driver_config_t;
+
+// ---------------------------------------------------------------------------
+//  modem_driver_get_state
+//
+//  Returns the current modem driver state. Use MODEM_DRIVER_IP_UP to check
+//  if the link is up and sockets are usable. Returns MODEM_DRIVER_IDLE if
+//  the driver has not been initialized.
+// ---------------------------------------------------------------------------
+modem_driver_state_t modem_driver_get_state(void);
 
 // ---------------------------------------------------------------------------
 //  modem_driver_init

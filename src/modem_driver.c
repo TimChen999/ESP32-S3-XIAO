@@ -23,6 +23,9 @@ static const char *TAG = "MODEM_DRV";
 // Echo state: Will it echo? True when ATE0 succeeds so read_response can skip stripping
 static bool g_echo_disabled = false;
 
+// Config pointer for modem_driver_get_state (set in init, used by task)
+static modem_driver_config_t *s_config = NULL;
+
 // ============================================================================
 //  INTERNAL HELPERS
 // ============================================================================
@@ -111,8 +114,14 @@ static bool response_contains(const char *response, const char *needle)
 //  PUBLIC API
 // ============================================================================
 
+modem_driver_state_t modem_driver_get_state(void)
+{
+    return (s_config != NULL) ? s_config->state : MODEM_DRIVER_IDLE;
+}
+
 void modem_driver_init(modem_driver_config_t *config)
 {
+    s_config = config;
     // 1. Set state variable in config to IDLE (init), used for debug/observability
     config->state = MODEM_DRIVER_IDLE;
 
@@ -652,9 +661,31 @@ static ppp_phase2_action_t modem_run_ppp_phase2(modem_driver_config_t *config)
         }
     }
 
-    // Unregister handlers, remove network interface
-    // TODO: Keep this after finishing 2.6, this is responsible for continuous data transfer
-    // Done, free buffer
+    if (result == PPP_POLL_GOT_IP) {
+        // Phase 2.6 — Use the link: keep PPP netif alive, continuously feed UART to lwIP.
+        // Other tasks can use standard socket APIs (connect, send, recv) — traffic routes
+        // through the default PPP netif. Runs until link down (LOST_IP, PPP status events).
+        getIP_fails = 0;
+        config->state = MODEM_DRIVER_IP_UP;
+        ESP_LOGI(TAG, "PPP IP acquisition success — Phase 2.6 link active");
+        printf("PPP Phase 2 complete — IP up, link active (sockets usable)\n");
+
+        s_ppp_result = PPP_POLL_NONE;  // Reset; Phase 2.6 watches for LOST_IP / status
+        while (1) {
+            int n = uart_read_bytes(config->uart_num, ppp_buf, PPP_RX_BUF_SIZE,
+                                    pdMS_TO_TICKS(100));
+            if (n > 0) {
+                esp_netif_receive(netif, ppp_buf, (size_t)n, NULL);
+            }
+            result = s_ppp_result;
+            if (result != PPP_POLL_NONE && result != PPP_POLL_GOT_IP) {
+                break;  // Link down or error — exit Phase 2.6
+            }
+        }
+        ESP_LOGW(TAG, "Phase 2.6 link down (result=%d) — cleaning up", (int)result);
+    }
+
+    // Cleanup: unregister handlers, tear down netif (on failure or Phase 2.6 link-down exit)
     free(ppp_buf);
     esp_event_handler_instance_unregister(IP_EVENT, ESP_EVENT_ANY_ID, ip_inst);
     esp_event_handler_instance_unregister(NETIF_PPP_STATUS, ESP_EVENT_ANY_ID, status_inst);
@@ -662,13 +693,7 @@ static ppp_phase2_action_t modem_run_ppp_phase2(modem_driver_config_t *config)
     esp_netif_action_stop(netif, 0, 0, 0);
     esp_netif_destroy(netif);
 
-    // Result of 
-    if (result == PPP_POLL_GOT_IP) {
-        ESP_LOGI(TAG, "PPP IP acquisition success");
-        printf("PPP Phase 2 complete — IP up\n");
-        return PPP_PHASE2_IDLE;
-    }
-
+    // If we reached here from Phase 2.6, result is FAIL_* (link down). Fall through to recovery.
     getIP_fails++;
     ESP_LOGW(TAG, "PPP IP failure (getIP_fails=%d)", getIP_fails);
 
@@ -699,8 +724,6 @@ static ppp_phase2_action_t modem_run_ppp_phase2(modem_driver_config_t *config)
         return PPP_PHASE2_FULL_RECOVERY;
     }
     return PPP_PHASE2_REDIAL;
-
-    // Phase 2.6 — Use the link (sockets, DNS, TLS) — left for later per user request.
 }
 
 void modem_driver_task(void *param)
